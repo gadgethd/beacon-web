@@ -3,9 +3,10 @@
 // the `echarts-for-react` wrapper (it was hit by a supply-chain attack 2026-05-19); EChart.tsx wraps
 // the core API directly instead.
 import * as echarts from "echarts/core";
-import { LineChart, BarChart, PieChart, GaugeChart } from "echarts/charts";
+import { LineChart, BarChart, PieChart, GaugeChart, GraphChart } from "echarts/charts";
 import {
   GridComponent,
+  TitleComponent,
   TooltipComponent,
   LegendComponent,
   GraphicComponent,
@@ -19,7 +20,9 @@ echarts.use([
   BarChart,
   PieChart,
   GaugeChart,
+  GraphChart,
   GridComponent,
+  TitleComponent,
   TooltipComponent,
   LegendComponent,
   GraphicComponent,

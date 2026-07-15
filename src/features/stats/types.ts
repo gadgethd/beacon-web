@@ -47,6 +47,12 @@ export interface RadioPreset {
   count: number;
 }
 
+export interface NodeTypeCount {
+  nodeType: number;
+  nodeTypeName: string;
+  count: number;
+}
+
 export interface ScopeStats {
   name: string; // normalized scope name e.g. "#bc"
   packetCount: number;
@@ -55,7 +61,7 @@ export interface ScopeStats {
 }
 
 export interface TelemetryPoint {
-  t: number; // epoch ms (normalized in useObserverTelemetry — backend raw path emits seconds)
+  t: number; // epoch ms
   batteryMv: number | null;
   airtimeTxPct: number | null;
   airtimeRxPct: number | null;
@@ -72,7 +78,7 @@ export interface ObserverTelemetry {
 }
 
 // Sub-tab + time-range identifiers shared across the Stats page.
-export type StatsTab = "mesh" | "observer";
+export type StatsTab = "mesh" | "observer" | "graph";
 export type StatsRange = "24h" | "7d" | "30d";
 
 export const RANGE_MS: Record<StatsRange, number> = {

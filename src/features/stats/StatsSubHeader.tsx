@@ -1,6 +1,6 @@
-import type { WsManager } from "../../api/ws-manager";
-import { useWsStatus } from "../../hooks/useWsStatus";
 import { Segmented } from "./Segmented";
+import { SelectDropdown } from "../../components/SelectDropdown";
+import { useIsMobile } from "../../hooks/useMediaQuery";
 import type { StatsRange, StatsTab } from "./types";
 
 function MeshIcon() {
@@ -23,10 +23,27 @@ function ObserverIcon() {
   );
 }
 
+function GraphIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden>
+      <circle cx="7" cy="7" r="1.7" />
+      <circle cx="2.4" cy="3" r="1.3" />
+      <circle cx="11.6" cy="3.4" r="1.3" />
+      <circle cx="4" cy="12" r="1.3" />
+      <circle cx="11" cy="11" r="1.3" />
+      <path d="M3.3 3.7 5.6 6M10.4 4 8.4 6M5.2 8.2 4.3 10.7M8.5 8.1 10.2 9.9" strokeOpacity="0.7" />
+    </svg>
+  );
+}
+
 const TAB_OPTIONS = [
   { value: "mesh", label: "Mesh", icon: <MeshIcon /> },
   { value: "observer", label: "Observer", icon: <ObserverIcon /> },
+  { value: "graph", label: "Neighbour Graph", icon: <GraphIcon /> },
 ];
+
+// Same sections, minus icons, for the mobile dropdown (which is text-only). Scales with TAB_OPTIONS.
+const TAB_SELECT_OPTIONS = TAB_OPTIONS.map(({ value, label }) => ({ value, label }));
 
 const RANGE_OPTIONS = [
   { value: "24h", label: "24h" },
@@ -39,38 +56,43 @@ interface Props {
   onTabChange: (tab: StatsTab) => void;
   range: StatsRange;
   onRangeChange: (range: StatsRange) => void;
-  wsManager: WsManager;
 }
 
-export function StatsSubHeader({ tab, onTabChange, range, onRangeChange, wsManager }: Props) {
-  const { status } = useWsStatus(wsManager);
-  const live = status === "connected";
-  const connecting = status === "connecting";
-  const dotColor = live ? "bg-green" : connecting ? "bg-warn" : "bg-text-dim";
-  const label = live ? "LIVE" : connecting ? "LIVE" : "OFFLINE";
-  const labelColor = live ? "text-green" : connecting ? "text-warn" : "text-text-dim";
-
+export function StatsSubHeader({ tab, onTabChange, range, onRangeChange }: Props) {
+  const isMobile = useIsMobile();
   return (
-    <div className="flex shrink-0 items-center justify-between border-b border-border bg-bg-surface px-4 py-2.5">
-      <Segmented
-        options={TAB_OPTIONS}
-        value={tab}
-        onChange={(v) => onTabChange(v as StatsTab)}
-        ariaLabel="Stats section"
-        size="md"
-      />
-      <div className="flex items-center gap-3">
+    <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border bg-bg-surface px-4 py-2.5">
+      {/* pills don't scale on a phone as sections grow — swap to a compact dropdown there */}
+      {isMobile ? (
+        <SelectDropdown
+          label="Section"
+          hideAll
+          align="left"
+          options={TAB_SELECT_OPTIONS}
+          value={tab}
+          onChange={(v) => onTabChange(v as StatsTab)}
+        />
+      ) : (
+        <div className="min-w-0 max-w-full overflow-x-auto">
+          <Segmented
+            options={TAB_OPTIONS}
+            value={tab}
+            onChange={(v) => onTabChange(v as StatsTab)}
+            ariaLabel="Stats section"
+            size="md"
+          />
+        </div>
+      )}
+      {/* the graph is topology, not time-series — no range to pick */}
+      {tab !== "graph" && (
         <Segmented
+          className="shrink-0"
           options={RANGE_OPTIONS}
           value={range}
           onChange={(v) => onRangeChange(v as StatsRange)}
           ariaLabel="Time range"
         />
-        <div className={`flex items-center gap-1.5 font-mono text-[11px] font-semibold ${labelColor}`}>
-          <span className={`inline-block h-[7px] w-[7px] rounded-full ${dotColor} ${live ? "shadow-[0_0_0_3px_color-mix(in_srgb,var(--color-green)_18%,transparent)]" : ""}`} />
-          {label}
-        </div>
-      </div>
+      )}
     </div>
   );
 }
