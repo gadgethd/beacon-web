@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import maplibregl from "maplibre-gl";
-import type { Map as MapLibreMap, RasterDEMSourceSpecification } from "maplibre-gl";
+import { Map as MapLibreMap, NavigationControl, ScaleControl, AttributionControl, LngLatBounds } from "maplibre-gl";
+import type { RasterDEMSourceSpecification } from "maplibre-gl";
 import {
   DEM_TILES,
   DEM_ATTRIBUTION,
@@ -103,7 +103,7 @@ export function useMapLibre(
 
     // open at the deep-link camera if one was given, else the default view; the fit effect frames the
     // selection once the style is ready (unless a deep-link camera suppresses that first fit)
-    const map = new maplibregl.Map({
+    const map = new MapLibreMap({
       container,
       style: resolveMapStyle(styleIdRef.current).url,
       center: initialCameraRef.current?.center ?? DEFAULT_CENTER,
@@ -116,9 +116,9 @@ export function useMapLibre(
     mapRef.current = map;
     lastStyleIdRef.current = styleIdRef.current;
 
-    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
-    map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
-    map.addControl(new maplibregl.AttributionControl({ compact: true })); // bottom-right
+    map.addControl(new NavigationControl({ visualizePitch: true }), "top-right");
+    map.addControl(new ScaleControl({ unit: "metric" }), "bottom-left");
+    map.addControl(new AttributionControl({ compact: true })); // bottom-right
     // maplibre pops the compact attribution open the first time the basemap credit loads (it tacks
     // on .maplibregl-compact-show). Mark it .maplibregl-compact up front so it skips that and stays
     // a bare (i) on load — clicking it still opens the credit.
@@ -148,7 +148,7 @@ export function useMapLibre(
     });
 
     map.on("error", (e) => {
-      const err = e as { error?: Error; sourceId?: string; tile?: unknown };
+      const err = e as unknown as { error?: Error; sourceId?: string; tile?: unknown };
       // A single tile/source failure (one basemap or DEM tile timing out / 403 / a momentary network
       // blip) is transient and non-fatal — the rest of the map stays usable — so never blank the map
       // for it. maplibre tags tile/source errors with a tile/sourceId; style-level errors have neither.
@@ -212,7 +212,7 @@ export function useMapLibre(
 
     const bounds = fitPoints.reduce(
       (b, p) => b.extend(p),
-      new maplibregl.LngLatBounds(fitPoints[0], fitPoints[0]),
+      new LngLatBounds(fitPoints[0], fitPoints[0]),
     );
     map.fitBounds(bounds, {
       padding: 48,
