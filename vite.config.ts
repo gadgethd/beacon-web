@@ -32,7 +32,6 @@ export default defineConfig(({ mode }) => {
               changeOrigin: true,
               secure: true,
               ws: true,
-              headers: { Origin: proxyTarget },
             },
           },
         }
