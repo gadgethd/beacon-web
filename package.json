@@ -1,7 +1,7 @@
 {
   "name": "beacon-web",
   "private": true,
-  "version": "1.2.1",
+  "version": "2.2.0",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "scripts": {
@@ -21,9 +21,11 @@
     "@tanstack/react-query": "^5.100.11",
     "@tanstack/react-virtual": "^3.13.25",
     "echarts": "6.1.0",
-    "maplibre-gl": "^6.4.1",
+    "i18next": "26.4.2",
+    "maplibre-gl": "^6.9.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
+    "react-i18next": "17.0.15",
     "react-router-dom": "^7.18.2"
   },
   "devDependencies": {
@@ -43,7 +45,10 @@
     "tailwindcss": "^4.3.0",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.2",
-    "vite": "^8.0.12",
-    "vitest": "^4.1.7"
+    "vite": "^8.3.6",
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "minimatch": "^11.0.1"
   }
 }

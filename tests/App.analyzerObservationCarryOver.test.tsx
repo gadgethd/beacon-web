@@ -11,6 +11,8 @@ vi.mock("../src/api/ws-manager", () => {
   class WsManager {
     connect() {}
     disconnect() {}
+    pause() {}
+    resume() { return false; }
     updateSubscription() {}
     onPacketObservation() { return () => {}; }
     onLagged() { return () => {}; }
@@ -24,6 +26,7 @@ vi.mock("../src/api/ws-manager", () => {
   return { WsManager };
 });
 
+vi.mock("../src/components/VersionGate", () => ({ VersionGate: () => null }));
 vi.mock("../src/api/client", () => ({
   getRegions: async () => [],
   getRegion: async () => ({ id: 0, slug: "", displayName: "", iatas: [] }),
@@ -32,13 +35,13 @@ vi.mock("../src/api/client", () => ({
 }));
 
 const packet: PacketSummary = {
-  packetHash: "AA11", payloadType: 1, payloadTypeName: "ADVERT",
+  packetHash: "aa11", payloadType: 1, payloadTypeName: "ADVERT",
   routeType: 1, routeTypeName: "FLOOD",
   firstHeardAt: 1700000000000, lastHeardAt: 1700000002000, observationCount: 3,
 };
 
 const detail = {
-  packetHash: "AA11",
+  packetHash: "aa11",
   header: { raw: "12", routeType: 1, routeTypeName: "FLOOD", payloadType: 1, payloadTypeName: "ADVERT", payloadVersion: 1 },
   firstHeardAt: 1700000000000, lastHeardAt: 1700000002000, firstToLastMs: 2000, observationCount: 3,
   rawPayload: "", decrypted: false,
@@ -70,7 +73,7 @@ vi.mock("../src/features/packets/usePackets", () => ({
 
 vi.mock("../src/features/packets/usePacketDetail", () => ({
   usePacketDetail: (hash: string | null) => ({
-    data: hash === "AA11" ? detail : undefined,
+    data: hash === "aa11" ? detail : undefined,
     isLoading: false,
     isError: false,
     refetch: () => {},
@@ -129,10 +132,19 @@ describe("opening the analyzer from an expanded row", () => {
   it("keeps the observation selected in the expanded row", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "AA11" }));
+    fireEvent.click(await screen.findByRole("button", { name: "aa11" }));
     fireEvent.click(await screen.findByText("Observer Three"));
 
     const drawer = await screen.findByTestId("packet-analyzer-drawer");
-    expect(within(drawer).getByText("Observer Three")).toBeInTheDocument();
+    expect(within(drawer).getByRole("button", { name: "Select observation: Observer Three" })).toHaveAttribute("aria-pressed", "true");
   });
+});
+
+it("replaces a shared observation when another report is selected in the row", async () => {
+  window.history.replaceState({}, "", "/?tab=Packets&hash=aa11&observation=3");
+  render(<App />);
+  fireEvent.click(await screen.findByText("Observer Two"));
+  const drawer = await screen.findByTestId("packet-analyzer-drawer");
+  expect(within(drawer).getByRole("button", { name: "Select observation: Observer Two" })).toHaveAttribute("aria-pressed", "true");
+  expect(new URLSearchParams(window.location.search).get("observation")).toBe("2");
 });

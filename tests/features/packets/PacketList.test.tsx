@@ -1,8 +1,9 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, fireEvent, within, act } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { PacketList } from "../../../src/features/packets/PacketList";
+import i18n from "../../../src/i18n";
 import type { WsManager } from "../../../src/api/ws-manager";
 import type { PacketSummary, PacketDetail } from "../../../src/types/api";
 import type { WsPacketObservation } from "../../../src/types/ws";
@@ -14,9 +15,11 @@ const basePackets = () => ({
   acknowledgeNewPackets: () => {},
   fetchNextPage: () => {},
   hasNextPage: false,
+  isFetching: false,
   isFetchingNextPage: false,
   isLoading: false,
   isError: false,
+  refetch: vi.fn(),
   observersByHash: new Map(),
   handlePacketObservation: () => {},
   handleLagged: () => {},
@@ -28,7 +31,8 @@ vi.mock("../../../src/features/packets/usePackets", () => ({
   usePackets: (...args: unknown[]) => usePackets(...(args as [])),
 }));
 
-const usePacketDetail = vi.fn(() => ({ data: undefined as PacketDetail | undefined }));
+const baseDetail = () => ({ data: undefined as PacketDetail | undefined, isLoading: false, isError: false, error: null as Error | null, refetch: vi.fn() });
+const usePacketDetail = vi.fn(baseDetail);
 vi.mock("../../../src/features/packets/usePacketDetail", () => ({
   usePacketDetail: (hash: string | null) => usePacketDetail(hash as never),
 }));
@@ -65,8 +69,8 @@ vi.mock("../../../src/features/packets/PacketVirtualList", () => ({
   }) => (
     <div>
       <div data-testid="expanded">{String(expandedHash)}</div>
-      <button type="button" onClick={onOpenAnalyzer}>Open analyzer</button>
-      <button type="button" onClick={onViewPath}>View path on map</button>
+      <button type="button" onClick={() => onOpenAnalyzer()}>Open analyzer</button>
+      <button type="button" onClick={onViewPath}>Map all paths</button>
       {packets.map((p) => (
         <button
           key={p.packetHash}
@@ -143,6 +147,23 @@ describe("PacketList loading feedback", () => {
     usePackets.mockImplementation(basePackets);
   });
 
+  it("applies latest-path search to the list and explains its scope", () => {
+    const matching = { ...packet("matched"), payloadType: 4, latestObserver: {
+      id: "o1", iata: "YOW", pathLength: { raw: "02", hashSize: 1, hopCount: 2 }, pathBytes: "7fa4",
+    } };
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [matching, packet("other")] }));
+    renderList("/?sf=path&q=7f%20a4&types=4");
+    expect(screen.getByText("matched")).toBeInTheDocument();
+    expect(screen.queryByText("other")).not.toBeInTheDocument();
+    expect(screen.getByText(/latest relay path in loaded packets/)).toBeInTheDocument();
+    expect(usePackets).toHaveBeenLastCalledWith(false, { payloadTypes: [4] });
+  });
+
+  it("explains an invalid path query instead of silently ignoring it", () => {
+    renderList("/?sf=path&q=not-hex");
+    expect(screen.getByRole("alert")).toHaveTextContent("whole hop hashes of the same length");
+  });
+
   it("shows skeletons instead of the list plus a loading pill during an empty initial load", () => {
     usePackets.mockImplementation(() => ({ ...basePackets(), isLoading: true }));
     renderList();
@@ -160,11 +181,24 @@ describe("PacketList loading feedback", () => {
     expect(screen.getByRole("status").textContent).toContain("Loading packets… (1)");
   });
 
-  it("surfaces a failed history fetch through the pill", () => {
-    usePackets.mockImplementation(() => ({ ...basePackets(), isError: true }));
+  it("shows an error with a retry, not an empty list, when history fails with nothing loaded", () => {
+    const refetch = vi.fn();
+    usePackets.mockImplementation(() => ({ ...basePackets(), isError: true, refetch }));
     renderList();
 
-    expect(screen.getByRole("status").textContent).toContain("Failed to load packets");
+    expect(screen.getByRole("alert")).toHaveTextContent("Failed to load packets");
+    expect(screen.queryByTestId("expanded")).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps loaded packets and surfaces a later history failure through the pill", () => {
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("h1")], isError: true }));
+    renderList();
+
+    expect(screen.getByTestId("expanded")).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toContain("Some packets failed to load (1 shown)");
   });
 
   it("renders neither pill nor skeletons when idle", () => {
@@ -178,82 +212,100 @@ describe("PacketList loading feedback", () => {
 describe("PacketList expanded row", () => {
   afterEach(() => {
     usePackets.mockImplementation(basePackets);
-    usePacketDetail.mockReturnValue({ data: undefined });
+    usePacketDetail.mockReturnValue(baseDetail());
   });
 
   it("expands a row from ?hash without opening the analyzer", () => {
-    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("AA11")] }));
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")] }));
 
-    const { onAnalyze } = renderList("/?tab=Packets&hash=AA11");
+    const { onAnalyze } = renderList("/?tab=Packets&hash=aa11");
 
-    expect(screen.getByRole("button", { name: /AA11/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /aa11/ })).toHaveAttribute("aria-expanded", "true");
     expect(onAnalyze).not.toHaveBeenCalled();
   });
 
+  // packet hashes are lowercase hex; a hand-typed or uppercased link must still match the row
+  it("expands the row from an uppercase ?hash", () => {
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")] }));
+
+    renderList("/?tab=Packets&hash=AA11");
+
+    expect(screen.getByRole("button", { name: /aa11/ })).toHaveAttribute("aria-expanded", "true");
+    expect(usePacketDetail).toHaveBeenLastCalledWith("aa11");
+  });
+
   it("clicking a row sets ?hash and does not open the analyzer", () => {
-    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("AA11")] }));
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")] }));
 
     const { onAnalyze } = renderList("/?tab=Packets");
 
-    fireEvent.click(screen.getByRole("button", { name: /AA11/ }));
+    fireEvent.click(screen.getByRole("button", { name: /aa11/ }));
     expect(onAnalyze).not.toHaveBeenCalled();
   });
 
   it("routes the expansion's Open analyzer through onAnalyze with the expanded hash", () => {
-    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("AA11")] }));
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")] }));
 
-    const { onAnalyze } = renderList("/?tab=Packets&hash=AA11");
+    const { onAnalyze } = renderList("/?tab=Packets&hash=aa11");
 
     fireEvent.click(screen.getByRole("button", { name: "Open analyzer" }));
-    expect(onAnalyze).toHaveBeenCalledWith("AA11");
+    expect(onAnalyze).toHaveBeenCalledWith("aa11");
   });
 
   it("hands the loaded detail to onViewPath", () => {
-    const detail = { packetHash: "AA11", observations: [] } as unknown as PacketDetail;
-    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("AA11")] }));
-    usePacketDetail.mockReturnValue({ data: detail });
+    const detail = { packetHash: "aa11", observations: [] } as unknown as PacketDetail;
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")] }));
+    usePacketDetail.mockReturnValue({ ...baseDetail(), data: detail });
 
-    const { onViewPath } = renderList("/?tab=Packets&hash=AA11");
+    const { onViewPath } = renderList("/?tab=Packets&hash=aa11");
 
-    fireEvent.click(screen.getByRole("button", { name: "View path on map" }));
+    fireEvent.click(screen.getByRole("button", { name: "Map all paths" }));
     expect(onViewPath).toHaveBeenCalledWith(detail);
   });
 
   it("does not call onViewPath before the detail has loaded", () => {
-    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("AA11")] }));
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")] }));
 
-    const { onViewPath } = renderList("/?tab=Packets&hash=AA11");
+    const { onViewPath } = renderList("/?tab=Packets&hash=aa11");
 
-    fireEvent.click(screen.getByRole("button", { name: "View path on map" }));
+    fireEvent.click(screen.getByRole("button", { name: "Map all paths" }));
     expect(onViewPath).not.toHaveBeenCalled();
   });
 });
 
 describe("PacketList live observation invalidation", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+
   afterEach(() => {
+    vi.useRealTimers();
     usePackets.mockImplementation(basePackets);
     packetHandler = null;
   });
 
-  it("refetches the expanded row's detail when an observation arrives for it", () => {
+  it("refetches the expanded row's detail once for a burst of observations, without cancelling a fetch", () => {
     const handlePacketObservation = vi.fn();
-    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("AA11")], handlePacketObservation }));
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")], handlePacketObservation }));
 
-    const { invalidate } = renderList("/?tab=Packets&hash=AA11");
+    const { invalidate } = renderList("/?tab=Packets&hash=aa11");
     invalidate.mockClear();
-    packetHandler!(observation("AA11"));
+    for (let i = 0; i < 5; i++) packetHandler!(observation("aa11"));
 
-    expect(handlePacketObservation).toHaveBeenCalledTimes(1);
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["packet-detail", "AA11"] });
+    // every observation still reaches the list, so the row's count keeps ticking
+    expect(handlePacketObservation).toHaveBeenCalledTimes(5);
+    expect(invalidate).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(5_000); });
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["packet-detail", "aa11"], exact: true }, { cancelRefetch: false });
   });
 
   it("leaves the detail query alone for observations on other packets", () => {
     const handlePacketObservation = vi.fn();
-    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("AA11")], handlePacketObservation }));
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")], handlePacketObservation }));
 
-    const { invalidate } = renderList("/?tab=Packets&hash=AA11");
+    const { invalidate } = renderList("/?tab=Packets&hash=aa11");
     invalidate.mockClear();
-    packetHandler!(observation("BB22"));
+    packetHandler!(observation("bb22"));
+    act(() => { vi.advanceTimersByTime(10_000); });
 
     expect(handlePacketObservation).toHaveBeenCalledTimes(1);
     expect(invalidate).not.toHaveBeenCalled();
@@ -261,12 +313,145 @@ describe("PacketList live observation invalidation", () => {
 
   it("does not invalidate when no row is expanded", () => {
     const handlePacketObservation = vi.fn();
-    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("AA11")], handlePacketObservation }));
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")], handlePacketObservation }));
 
     const { invalidate } = renderList("/?tab=Packets");
     invalidate.mockClear();
-    packetHandler!(observation("AA11"));
+    packetHandler!(observation("aa11"));
+    act(() => { vi.advanceTimersByTime(10_000); });
 
     expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it("drops the pending refetch when the row collapses", () => {
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")] }));
+
+    const { invalidate } = renderList("/?tab=Packets&hash=aa11");
+    invalidate.mockClear();
+    packetHandler!(observation("aa11"));
+    fireEvent.click(screen.getByRole("button", { name: "aa11" }));
+    act(() => { vi.advanceTimersByTime(10_000); });
+
+    expect(screen.getByTestId("expanded")).toHaveTextContent("null");
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+});
+
+describe("PacketList selected packet outside the loaded results", () => {
+  afterEach(() => {
+    usePackets.mockImplementation(basePackets);
+    usePacketDetail.mockReturnValue(baseDetail());
+  });
+
+  it("offers the existing analyzer without scanning history for an unloaded packet", () => {
+    const fetchNextPage = vi.fn();
+    usePackets.mockImplementation(() => ({ ...basePackets(), hasNextPage: true, fetchNextPage }));
+    usePacketDetail.mockReturnValue({ ...baseDetail(), data: { packetHash: "aa11" } as PacketDetail });
+    const { onAnalyze } = renderList("/?hash=aa11");
+    const notice = screen.getByRole("region", { name: "Selected packet" });
+    expect(notice).toHaveTextContent("outside the loaded results");
+    fireEvent.click(within(notice).getByRole("button", { name: "Open analyzer" }));
+    expect(onAnalyze).toHaveBeenCalledWith("aa11");
+    expect(fetchNextPage).not.toHaveBeenCalled();
+  });
+
+  it("offers the action when current filters hide a loaded selection", () => {
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")] }));
+    usePacketDetail.mockReturnValue({ ...baseDetail(), data: { packetHash: "aa11" } as PacketDetail });
+    renderList("/?hash=aa11&q=other");
+    expect(screen.getByRole("region", { name: "Selected packet" })).toHaveTextContent("outside the loaded results");
+    fireEvent.click(screen.getByRole("button", { name: "Clear", exact: true }));
+    expect(screen.queryByRole("region", { name: "Selected packet" })).toBeNull();
+    expect(screen.getByRole("button", { name: "aa11", exact: true })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it.each(["/?hash=aa11", "/?hash=aa11&analyze=1", "/"])("does not duplicate a loaded row or an analyzer (%s)", (url) => {
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("aa11")] }));
+    renderList(url);
+    expect(screen.queryByRole("region", { name: "Selected packet" })).toBeNull();
+  });
+
+  it("waits for the initial list before declaring the selection outside it", () => {
+    usePackets.mockImplementation(() => ({ ...basePackets(), isLoading: true }));
+    renderList("/?hash=aa11");
+    expect(screen.queryByRole("region", { name: "Selected packet" })).toBeNull();
+  });
+
+  it("shows the selected detail loading state", () => {
+    usePacketDetail.mockReturnValue({ ...baseDetail(), isLoading: true });
+    renderList("/?hash=aa11");
+    expect(screen.getByRole("region", { name: "Selected packet" })).toHaveTextContent("Loading selected packet");
+  });
+
+  it.each([[400, "Invalid packet hash"], [404, "Packet not found"], [503, "Failed to load selected packet"]])("explains HTTP %i and lets the user retry", (status, message) => {
+    const refetch = vi.fn();
+    usePacketDetail.mockReturnValue({ ...baseDetail(), isError: true, error: Object.assign(new Error("request failed"), { status }), refetch });
+    renderList("/?hash=aa11");
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+    fireEvent.click(screen.getByRole("button", { name: "Retry selected packet" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("dismisses only the selection, leaving the current filters in place", () => {
+    usePacketDetail.mockReturnValue({ ...baseDetail(), data: { packetHash: "aa11" } as PacketDetail });
+    renderList("/?hash=aa11&q=other&types=4");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss selected packet" }));
+    expect(screen.queryByRole("region", { name: "Selected packet" })).toBeNull();
+    expect(screen.getByTestId("expanded")).toHaveTextContent("null");
+    expect(screen.getByPlaceholderText("Search by hash...")).toHaveValue("other");
+    expect(usePackets).toHaveBeenLastCalledWith(false, { payloadTypes: [4] });
+  });
+});
+
+describe("PacketList hash search", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    usePackets.mockImplementation(basePackets);
+  });
+
+  it("sends a typed hex hash search server-side once the search box settles", () => {
+    vi.useFakeTimers();
+    renderList();
+    fireEvent.change(screen.getByPlaceholderText("Search by hash..."), { target: { value: "6DDF" } });
+    expect(usePackets).toHaveBeenLastCalledWith(false, null);
+    act(() => { vi.runOnlyPendingTimers(); });
+    expect(usePackets).toHaveBeenLastCalledWith(false, { hashPrefix: "6ddf" });
+  });
+
+  it("starts with the URL's hash search already server-side", () => {
+    renderList("/?q=6ddf62");
+    expect(usePackets).toHaveBeenLastCalledWith(false, { hashPrefix: "6ddf62" });
+  });
+
+  it("still filters live packets client-side while a hash search is active", () => {
+    usePackets.mockImplementation(() => ({ ...basePackets(), allPackets: [packet("6ddf0001"), packet("aa110002")] }));
+    renderList("/?q=6ddf");
+    expect(screen.getByRole("button", { name: "6ddf0001" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "aa110002" })).toBeNull();
+  });
+});
+
+describe("PacketList in French", () => {
+  it("translates the banners and the selected-packet card", async () => {
+    await i18n.changeLanguage("fr");
+    usePackets.mockImplementation(() => ({ ...basePackets(), laggedCount: 2 }));
+    usePacketDetail.mockReturnValue({ ...baseDetail(), data: { packetHash: "aa11" } as PacketDetail });
+    renderList("/?hash=aa11");
+    expect(screen.getByText("2 paquets perdus — les données peuvent être incomplètes")).toBeInTheDocument();
+    expect(screen.getByText("Paquets en direct")).toBeInTheDocument();
+    const card = screen.getByRole("region", { name: "Paquet sélectionné" });
+    expect(card).toHaveTextContent("Le paquet sélectionné est hors des résultats chargés.");
+    expect(within(card).getByRole("button", { name: "Ouvrir l’analyseur" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Fermer le paquet sélectionné" })).toBeInTheDocument();
+  });
+
+  it("translates the error state and the path-search hint", async () => {
+    await i18n.changeLanguage("fr");
+    usePackets.mockImplementation(basePackets);
+    usePacketDetail.mockReturnValue({ ...baseDetail(), isError: true, error: Object.assign(new Error("x"), { status: 404 }) });
+    renderList("/?hash=aa11&sf=path");
+    expect(screen.getByText("Paquet introuvable.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Réessayer de charger le paquet sélectionné" })).toHaveTextContent("Réessayer");
+    expect(screen.getByText(/Recherche dans le dernier trajet de relais/)).toBeInTheDocument();
   });
 });

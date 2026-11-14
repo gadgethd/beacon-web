@@ -1,7 +1,9 @@
+import { useTranslation } from "react-i18next";
 import type { Observation } from "../../types/api";
 import { formatSnr, formatPropagation, snrLevel, SIGNAL_LEVEL_CLASSES } from "../../lib/formatters";
 import { Timestamp } from "../../components/Timestamp";
 import { PathData } from "./PathData";
+import { EmojiText } from "../../components/EmojiText";
 
 interface Props {
   observations: Observation[];
@@ -11,18 +13,19 @@ interface Props {
 
 // Per-observer readings vary by distance; presentational component owned by caller.
 export function ObservationTable({ observations, selectedId, onSelect }: Props) {
+  const { t } = useTranslation();
   return (
     <table className="w-full text-[10px] border-collapse">
       <thead>
         <tr className="text-text-dim uppercase tracking-wider text-[9px]">
-          <th className="text-left font-medium py-1 px-1.5">Observer</th>
-          <th className="text-left font-medium py-1 px-1.5">IATA</th>
-          <th className="text-left font-medium py-1 px-1.5">Heard</th>
+          <th className="text-left font-medium py-1 px-1.5">{t("observation.observer")}</th>
+          <th className="text-left font-medium py-1 px-1.5">{t("observation.area")}</th>
+          <th className="text-left font-medium py-1 px-1.5">{t("observation.heard")}</th>
           <th className="text-left font-medium py-1 px-1.5">SNR</th>
           <th className="text-left font-medium py-1 px-1.5">RSSI</th>
-          <th className="text-left font-medium py-1 px-1.5">Prop</th>
-          <th className="text-left font-medium py-1 px-1.5">Hops</th>
-          <th className="text-left font-medium py-1 px-1.5">Path</th>
+          <th className="text-left font-medium py-1 px-1.5">{t("observation.prop")}</th>
+          <th className="text-left font-medium py-1 px-1.5">{t("observation.hops")}</th>
+          <th className="text-left font-medium py-1 px-1.5">{t("observation.path")}</th>
         </tr>
       </thead>
       <tbody>
@@ -35,7 +38,7 @@ export function ObservationTable({ observations, selectedId, onSelect }: Props) 
               onClick={() => onSelect(o.id)}
               className={`cursor-pointer border-t border-border-subtle ${o.id === selectedId ? "bg-primary/8" : "hover:bg-bg-raised/40"}`}
             >
-              <td className="py-1 px-1.5 text-text-normal">{o.observerName ?? o.observerId.slice(0, 8)}</td>
+              <td className="py-1 px-1.5 text-text-normal"><EmojiText text={o.observerName ?? o.observerId.slice(0, 8)} /></td>
               <td className="py-1 px-1.5 font-mono font-bold text-primary tracking-wider">{o.iata}</td>
               <td className="py-1 px-1.5 text-text-muted"><Timestamp value={o.heardAt} /></td>
               <td className={`py-1 px-1.5 font-mono ${level ? SIGNAL_LEVEL_CLASSES[level] : "text-text-dim"}`}>

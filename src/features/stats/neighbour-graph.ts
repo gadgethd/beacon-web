@@ -1,8 +1,10 @@
+import type { TFunction } from "i18next";
 import type { NodeSummary, NodeNeighbor } from "../nodes/types";
 import { NODE_TYPE_NAMES, NODE_TYPES } from "../../lib/node-types";
 import { blend, nodeTypeColor, tooltipStyle, withAlpha, type ChartColors } from "./chartTheme";
 import { OBS_STOPS, AGE } from "../map/neighbor-thresholds";
 import type { EChartsOption } from "./echarts-setup";
+import type { ForceLayoutInput } from "./graph-layout";
 
 const MONO = "JetBrains Mono, monospace";
 
@@ -17,6 +19,8 @@ export interface GraphNode {
   degree: number;
   symbolSize: number;
   label?: { show: boolean; fontSize?: number };
+  x?: number; // fixed position from the layout worker (big mesh only)
+  y?: number;
 }
 
 export interface GraphLink {
@@ -39,6 +43,9 @@ const MAX_SIZE = 34;
 const HUB_LABELS = 30; // only the biggest hubs get a persistent label, else 1000 nodes are a text wall
 const MIN_LABEL = 9;
 const MAX_LABEL = 16;
+// Past this many nodes the in-chart force layout settles in one synchronous run that freezes the page,
+// so the full mesh is laid out in a worker and drawn at fixed positions instead.
+export const WORKER_LAYOUT_OVER = 500;
 
 // Case-insensitive substring match for the graph search; an empty query matches nothing.
 export function nodeNameMatches(name: string, query: string): boolean {
@@ -110,6 +117,27 @@ function symbolSize(degree: number, maxDegree: number): number {
   return MIN_SIZE + (MAX_SIZE - MIN_SIZE) * t;
 }
 
+// The big mesh's force settings for the worker. ECharts uses the middle of the edgeLength range when
+// links carry no value, as here; the start box is a typical desktop chart, fixed so every screen gets
+// the same picture.
+export function meshLayoutInput(graph: NeighbourGraph): ForceLayoutInput {
+  return {
+    count: graph.nodes.length,
+    source: Int32Array.from(graph.links, (l) => l.source),
+    target: Int32Array.from(graph.links, (l) => l.target),
+    repulsion: 60,
+    edgeLength: 40,
+    gravity: 0.08,
+    friction: 0.2,
+    rect: { x: 0, y: 0, width: 1200, height: 600 },
+    seed: 1,
+  };
+}
+
+export function withLayout(graph: NeighbourGraph, xy: Float64Array): NeighbourGraph {
+  return { ...graph, nodes: graph.nodes.map((n, i) => ({ ...n, x: xy[2 * i], y: xy[2 * i + 1] })) };
+}
+
 // Observation count → colour, log10 axis red→yellow→green (ports the map's line-colour expression).
 export function obsColor(obs: number, c: { danger: string; warn: string; green: string }): string {
   const x = Math.log10(Math.max(1, obs));
@@ -172,10 +200,10 @@ export function buildEgoGraph(
 
 // One legend/category per device type (in NODE_TYPES order) plus an "Other" bucket for unknowns; the
 // GraphNode.category index lines up with this list.
-function graphCategories(c: ChartColors) {
+function graphCategories(c: ChartColors, t: TFunction) {
   return [
-    ...NODE_TYPES.map((t) => ({ name: t.label, itemStyle: { color: nodeTypeColor(t.name, c) } })),
-    { name: "Other", itemStyle: { color: c.primaryDim } },
+    ...NODE_TYPES.map((type) => ({ name: t(`nodeTypes.${type.name}`), itemStyle: { color: nodeTypeColor(type.name, c) } })),
+    { name: t("neighbourGraph.other"), itemStyle: { color: c.primaryDim } },
   ];
 }
 
@@ -185,10 +213,12 @@ function graphCategories(c: ChartColors) {
 export function neighbourGraphOption(
   graph: NeighbourGraph,
   c: ChartColors,
+  t: TFunction,
   opts: { ego?: boolean } = {},
 ): EChartsOption {
   const ego = !!opts.ego;
-  const big = graph.nodes.length > 500; // settle without animating once the full mesh gets dense
+  const big = graph.nodes.length > WORKER_LAYOUT_OVER; // settle without animating once the full mesh gets dense
+  const placed = graph.nodes.length > 0 && graph.nodes.every((n) => n.x != null && n.y != null);
   // weighted edges (ego view) get an obs→colour, freshness→opacity line; plain mesh edges stay uniform
   const links = graph.links.map((l) =>
     l.obs != null
@@ -207,16 +237,16 @@ export function neighbourGraphOption(
           const obs = param.data.obs as number | undefined;
           if (obs == null) return ""; // uniform mesh edge — nothing to show
           const days = Math.round((param.data.ageDays as number) ?? 0);
-          return `${obs} obs · ${days === 0 ? "seen today" : `seen ${days}d ago`}`;
+          return days === 0 ? t("neighbourGraph.edgeToday", { obs }) : t("neighbourGraph.edgeAgo", { obs, days });
         }
         const d = param.data as unknown as GraphNode;
-        const type = d.nodeTypeName || "unknown";
-        return d.degree > 0 ? `${d.name}\n${type} · ${d.degree} neighbour${d.degree === 1 ? "" : "s"}` : `${d.name}\n${type}`;
+        const type = d.nodeTypeName || t("neighbourGraph.unknownType");
+        return d.degree > 0 ? `${d.name}\n${type} · ${t("neighbourGraph.neighbors", { count: d.degree })}` : `${d.name}\n${type}`;
       },
     },
     legend: [
       {
-        data: graphCategories(c).map((cat) => cat.name),
+        data: graphCategories(c, t).map((cat) => cat.name),
         bottom: 4,
         left: "center",
         icon: "circle",
@@ -229,11 +259,13 @@ export function neighbourGraphOption(
     series: [
       {
         type: "graph",
-        layout: "force",
+        layout: placed ? "none" : "force",
+        // sized to the layout's extent, ECharts maps it 1:1 (as the force layout's own frame) and centred
+        ...(placed ? extent(graph.nodes) : {}),
         roam: true,
         draggable: true,
         scaleLimit: { min: 0.2, max: 8 },
-        categories: graphCategories(c),
+        categories: graphCategories(c, t),
         force: ego
           ? { repulsion: 320, edgeLength: 120, gravity: 0.05, friction: 0.15, layoutAnimation: true }
           : { repulsion: big ? 60 : 120, edgeLength: big ? [20, 60] : [40, 90], gravity: 0.08, friction: 0.2, layoutAnimation: !big },
@@ -247,4 +279,16 @@ export function neighbourGraphOption(
       },
     ],
   };
+}
+
+function extent(nodes: GraphNode[]): { width: number; height: number } {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x!);
+    maxX = Math.max(maxX, n.x!);
+    minY = Math.min(minY, n.y!);
+    maxY = Math.max(maxY, n.y!);
+  }
+  // ECharts widens a zero-size extent to 2
+  return { width: maxX - minX || 2, height: maxY - minY || 2 };
 }

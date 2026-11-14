@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import { PacketVirtualList } from "../../../src/features/packets/PacketVirtualList";
+import i18n from "../../../src/i18n";
 import type { PacketSummary } from "../../../src/types/api";
+import { stubVirtualLayout } from "../../virtual-layout";
 
 // PacketExpansion fetches through usePacketDetail; stub it so the list renders without a query client.
 const usePacketDetail = vi.fn(() => ({ data: { packetHash: "AA11", header: { payloadType: 1 }, observations: [] } }));
@@ -13,9 +15,7 @@ const VIEWPORT_H = 1300;
 const ROW_H = 60;
 const EXPANDED_H = 400;
 
-// jsdom has no layout and no ResizeObserver, so feed the virtualizer both: offsetHeight answers for
-// the viewport and for each measured item (taller once it holds an expansion), and flushResize()
-// stands in for the browser noticing a row changed height.
+// jsdom has no ResizeObserver either; flushResize() stands in for the browser noticing a row changed height
 type Observed = { cb: ResizeObserverCallback; targets: Set<Element> };
 const observers: Observed[] = [];
 
@@ -40,13 +40,8 @@ function flushResize() {
   });
 }
 
-Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
-  configurable: true,
-  get(this: HTMLElement) {
-    if (!this.hasAttribute("data-index")) return VIEWPORT_H;
-    return this.querySelector("[data-testid='packet-expansion']") ? EXPANDED_H : ROW_H;
-  },
-});
+// items grow once they hold an expansion
+stubVirtualLayout(VIEWPORT_H, (item) => (item.querySelector("[data-testid='packet-expansion']") ? EXPANDED_H : ROW_H));
 
 const pkt = (hash: string): PacketSummary => ({
   packetHash: hash, payloadType: 1, payloadTypeName: "ADVERT",
@@ -59,7 +54,7 @@ const many = (n: number) => Array.from({ length: n }, (_, i) => pkt(`AA${i}`));
 function makeHandlers() {
   return {
     hasNextPage: false,
-    isFetchingNextPage: false,
+    isFetching: false,
     fetchNextPage: vi.fn(),
     onScrollAwayFromTop: vi.fn(),
     onAtTopChange: vi.fn(),
@@ -143,7 +138,7 @@ describe("PacketVirtualList expansion", () => {
 
     // clicking an observation is what opens the analyzer now — there is no button for it
     fireEvent.click(screen.getByText("o1"));
-    fireEvent.click(screen.getByRole("button", { name: "View path on map" }));
+    fireEvent.click(screen.getByRole("button", { name: "Map all paths" }));
 
     expect(handlers.onSelectObservation).toHaveBeenCalledWith(1);
     expect(handlers.onOpenAnalyzer).toHaveBeenCalledTimes(1);
@@ -167,6 +162,51 @@ describe("PacketVirtualList header", () => {
 });
 
 describe("PacketVirtualList scrolling", () => {
+  it.each([0, 1])("can manually page with %i visible rows and no scrollbar", (count) => {
+    const handlers = makeHandlers();
+    const { rerender } = render(
+      <PacketVirtualList packets={many(count)} expandedHash={null} {...handlers} hasNextPage />,
+    );
+
+    expect(handlers.fetchNextPage).not.toHaveBeenCalled();
+    if (count === 0) expect(screen.getByText("No matching packets loaded.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load older packets" }));
+    expect(handlers.fetchNextPage).toHaveBeenCalledTimes(1);
+
+    // A still-empty result after the page arrives must not start scanning further pages.
+    rerender(<PacketVirtualList packets={[]} expandedHash={null} {...handlers} hasNextPage />);
+    flushResize();
+    expect(handlers.fetchNextPage).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Load older packets" }));
+    expect(handlers.fetchNextPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("disables manual paging during a request and allows retry afterward", () => {
+    const handlers = makeHandlers();
+    const { rerender } = render(
+      <PacketVirtualList packets={[]} expandedHash={null} {...handlers} hasNextPage isFetching />,
+    );
+    const pending = screen.getByRole("button", { name: "Loading packets..." });
+    expect(pending).toBeDisabled();
+    fireEvent.click(pending);
+    expect(handlers.fetchNextPage).not.toHaveBeenCalled();
+
+    rerender(<PacketVirtualList packets={[]} expandedHash={null} {...handlers} hasNextPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Load older packets" }));
+    expect(handlers.fetchNextPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("removes manual paging when the history cursor is exhausted", () => {
+    const handlers = makeHandlers();
+    const { rerender } = render(
+      <PacketVirtualList packets={[]} expandedHash={null} {...handlers} hasNextPage />,
+    );
+    expect(screen.getByRole("button", { name: "Load older packets" })).toBeEnabled();
+    rerender(<PacketVirtualList packets={[]} expandedHash={null} {...handlers} />);
+    expect(screen.queryByRole("button", { name: "Load older packets" })).not.toBeInTheDocument();
+    expect(handlers.fetchNextPage).not.toHaveBeenCalled();
+  });
+
   it("pages when scrolled near the bottom", () => {
     const handlers = makeHandlers();
     const { container } = render(
@@ -183,7 +223,7 @@ describe("PacketVirtualList scrolling", () => {
   it("does not page while a page is already in flight", () => {
     const handlers = makeHandlers();
     const { container } = render(
-      <PacketVirtualList packets={many(30)} expandedHash={null} {...handlers} hasNextPage isFetchingNextPage />,
+      <PacketVirtualList packets={many(30)} expandedHash={null} {...handlers} hasNextPage isFetching />,
     );
 
     const el = scroller(container);
@@ -276,5 +316,14 @@ describe("PacketVirtualList responsive row", () => {
     render(<PacketVirtualList packets={[pkt("AA11")]} expandedHash="AA11" {...makeHandlers()} />);
 
     expect(screen.getByTestId("packet-expansion")).toBeInTheDocument();
+  });
+});
+
+describe("PacketVirtualList in French", () => {
+  it("translates the empty state and the load-older button", async () => {
+    await i18n.changeLanguage("fr");
+    render(<PacketVirtualList packets={[]} expandedHash={null} {...makeHandlers()} hasNextPage />);
+    expect(screen.getByText("Aucun paquet correspondant chargé.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Charger des paquets plus anciens" })).toBeInTheDocument();
   });
 });

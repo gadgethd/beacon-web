@@ -1,6 +1,8 @@
 // src/features/map/PacketPathMap.tsx
 import { useEffect, useRef, useState } from "react";
 import { Map as MapLibreMap, NavigationControl, AttributionControl, Popup, LngLatBounds } from "maplibre-gl";
+import "maplibre-gl/dist/maplibre-gl.css";
+import "./maplibre-worker";
 import type {
   GeoJSONSource,
   LineLayerSpecification,
@@ -11,6 +13,8 @@ import type { Point } from "geojson";
 import type { PacketPath } from "./packet-path";
 import { packetPathsToFeatures } from "./packet-path";
 import { resolveMapStyle, DEFAULT_CENTER, DEFAULT_ZOOM, IATA_ZOOM } from "./types";
+import { mapLocale } from "./useMapLibre";
+import { splitEmoji } from "../../lib/emoji";
 
 // Private ids — this map instance is dedicated to the popup, so they can't collide with the main map.
 const LINE_SOURCE = "pp-lines";
@@ -43,6 +47,7 @@ export function PacketPathMap({ paths, selectedKey, styleId }: {
       center: DEFAULT_CENTER,
       zoom: DEFAULT_ZOOM,
       attributionControl: false,
+      locale: mapLocale(),
     });
     mapRef.current = map;
     map.addControl(new NavigationControl({ showCompass: false }), "top-right");
@@ -62,7 +67,13 @@ export function PacketPathMap({ paths, selectedKey, styleId }: {
       const el = document.createElement("div");
       const name = document.createElement("div");
       name.className = "pp-popup-name";
-      name.textContent = (f.properties?.title as string) ?? "";
+      for (const part of splitEmoji((f.properties?.title as string) ?? "")) {
+        if (!part.emoji) { name.append(part.text); continue; }
+        const glyph = document.createElement("span");
+        glyph.className = "emoji-glyph";
+        glyph.textContent = part.text;
+        name.append(glyph);
+      }
       const coords = document.createElement("div");
       coords.className = "pp-popup-coords";
       coords.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
@@ -110,7 +121,7 @@ export function PacketPathMap({ paths, selectedKey, styleId }: {
     if (!map.getLayer(NODE_LABEL_LAYER)) {
       map.addLayer({
         id: NODE_LABEL_LAYER, type: "symbol", source: NODE_SOURCE,
-        layout: { "text-field": ["get", "label"], "text-size": 11, "text-offset": [0, 1.1], "text-anchor": "top", "text-optional": true },
+        layout: { "text-field": ["get", "label"], "text-font": ["Noto Sans Regular"], "text-size": 11, "text-offset": [0, 1.1], "text-anchor": "top", "text-optional": true },
         paint: {
           "text-color": paletteVar("--palette-text-bright", "#e5e7eb"),
           "text-halo-color": paletteVar("--palette-bg-base", "#0a0a0a"),

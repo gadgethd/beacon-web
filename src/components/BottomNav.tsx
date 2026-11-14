@@ -1,15 +1,18 @@
 import { useState, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 import { BottomSheet } from "./BottomSheet";
 import { ENABLED_TABS } from "../lib/constants";
+import { touchClick } from "../lib/touch-click";
 
 // Mobile-only tab bar (hidden at md+); overflow tabs live behind "More" in a bottom sheet.
 const PRIMARY_TABS = ["Packets", "Channels", "Map", "Nodes"] as const;
-const OVERFLOW_TABS = ["Observers", "Routes", "Traces", "Analytics"] as const;
-
+const OVERFLOW_TABS = ["Observers", "Routes", "Traces", "Atlas", "Analytics"] as const;
 // inline SVGs, 20px / 1.6 stroke to match the rest of the icons
 function Icon({ name }: { name: string }) {
   const common = { width: 20, height: 20, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.6, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
   switch (name) {
+    case "Atlas":
+      return <svg {...common}><circle cx="12" cy="12" r="9" /><path d="m16 8-2.5 5.5L8 16l2.5-5.5L16 8z" /></svg>;
     case "Packets":
       return (
         <svg {...common}>
@@ -61,6 +64,7 @@ function NavButton({ label, icon, active, onClick, role, ariaSelected, ariaHasPo
   ariaHasPopup?: "menu";
   ariaExpanded?: boolean;
 }) {
+  const tap = touchClick(onClick);
   return (
     <button
       type="button"
@@ -68,7 +72,7 @@ function NavButton({ label, icon, active, onClick, role, ariaSelected, ariaHasPo
       aria-selected={ariaSelected}
       aria-haspopup={ariaHasPopup}
       aria-expanded={ariaExpanded}
-      onClick={onClick}
+      {...tap}
       className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-1.5 text-[10px] font-medium tracking-wide cursor-pointer transition-colors ${
         active ? "text-primary" : "text-text-muted hover:text-text-normal"
       }`}
@@ -79,28 +83,36 @@ function NavButton({ label, icon, active, onClick, role, ariaSelected, ariaHasPo
   );
 }
 
+function SheetItem({ label, active, onPick }: { label: string; active: boolean; onPick: () => void }) {
+  const tap = touchClick(onPick);
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      {...tap}
+      className={`w-full flex items-center gap-3 px-5 py-3 text-left text-sm font-medium cursor-pointer transition-colors ${
+        active ? "text-primary" : "text-text-normal hover:bg-text-normal/3"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
 // Bottom sheet listing the overflow tabs.
 function MoreSheet({ tabs, activeTab, onPick, onClose }: { tabs: string[]; activeTab: string; onPick: (tab: string) => void; onClose: () => void }) {
+  const { t } = useTranslation();
   return (
-    <BottomSheet onClose={onClose} role="menu" label="More tabs">
+    <BottomSheet onClose={onClose} role="menu" label={t("navigation.moreTabs")}>
       {tabs.map((tab) => (
-        <button
-          key={tab}
-          type="button"
-          role="menuitem"
-          onClick={() => onPick(tab)}
-          className={`w-full flex items-center gap-3 px-5 py-3 text-left text-sm font-medium cursor-pointer transition-colors ${
-            activeTab === tab ? "text-primary" : "text-text-normal hover:bg-text-normal/3"
-          }`}
-        >
-          {tab}
-        </button>
+        <SheetItem key={tab} label={t(`tabs.${tab}`, { defaultValue: tab })} active={activeTab === tab} onPick={() => onPick(tab)} />
       ))}
     </BottomSheet>
   );
 }
 
 export function BottomNav({ activeTab, onTabChange }: { activeTab: string; onTabChange: (tab: string) => void }) {
+  const { t } = useTranslation();
   const [sheetOpen, setSheetOpen] = useState(false);
   const enabled = new Set<string>(ENABLED_TABS);
   const primary: string[] = PRIMARY_TABS.filter((t) => enabled.has(t));
@@ -114,11 +126,11 @@ export function BottomNav({ activeTab, onTabChange }: { activeTab: string; onTab
 
   return (
     <>
-      <nav className="flex md:hidden shrink-0 bg-bg-surface border-t border-border" role="tablist" aria-label="Primary">
+      <nav className="flex md:hidden shrink-0 bg-bg-surface border-t border-border" role="tablist" aria-label={t("navigation.primary")}>
         {primary.map((tab) => (
           <NavButton
             key={tab}
-            label={tab}
+            label={t(`tabs.${tab}`, { defaultValue: tab })}
             icon={<Icon name={tab} />}
             active={activeTab === tab}
             onClick={() => onTabChange(tab)}
@@ -128,7 +140,7 @@ export function BottomNav({ activeTab, onTabChange }: { activeTab: string; onTab
         ))}
         {overflow.length > 0 && (
           <NavButton
-            label="More"
+            label={t("navigation.more")}
             icon={<Icon name="More" />}
             active={overflowActive || sheetOpen}
             onClick={() => setSheetOpen((v) => !v)}

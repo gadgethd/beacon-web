@@ -3,12 +3,16 @@ import { renderHook, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { usePackets } from "../../../src/features/packets/usePackets";
+import { matchesFilters } from "../../../src/features/packets/usePacketFilters";
+import { EMPTY_FILTERS } from "../../../src/features/packets/types";
 import type { PacketServerFilter } from "../../../src/features/packets/types";
 import type { PacketSummary } from "../../../src/types/api";
 import type { WsPacketObservation } from "../../../src/types/ws";
+import { noteRateLimited, noteRequestOk } from "../../../src/api/rate-limit";
 
+const region: { iatas: string[] | undefined; regionKey: string; isResolved: boolean } = { iatas: ["YOW"], regionKey: "YOW", isResolved: true };
 vi.mock("../../../src/hooks/useRegion", () => ({
-  useRegion: () => ({ iatas: ["YOW"], regionKey: "YOW" }),
+  useRegion: () => region,
 }));
 
 const getPackets = vi.fn();
@@ -32,11 +36,11 @@ function packet(hash: string): PacketSummary {
 function seedThreePages(qc: QueryClient) {
   qc.setQueryData(["packets", "YOW"], {
     pages: [
-      { items: [packet("a1")], nextCursor: 200 },
-      { items: [packet("b2")], nextCursor: 100 },
-      { items: [packet("c3")], nextCursor: null },
+      { items: [packet("a1")], nextCursor: 200, hasMore: true },
+      { items: [packet("b2")], nextCursor: 100, hasMore: true },
+      { items: [packet("c3")], nextCursor: null, hasMore: false },
     ],
-    pageParams: [undefined, 200, 100],
+    pageParams: [undefined, { cursor: 200 }, { cursor: 100 }],
   });
 }
 
@@ -46,7 +50,7 @@ describe("usePackets gap healing", () => {
   beforeEach(() => {
     getPackets.mockReset();
     // nextCursor stays truthy so an invalidate would replay every cached page — the behavior under test
-    getPackets.mockResolvedValue({ items: [packet("fresh")], nextCursor: 999 });
+    getPackets.mockResolvedValue({ items: [packet("fresh")], nextCursor: 999, hasMore: true });
     qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   });
 
@@ -85,6 +89,23 @@ describe("usePackets gap healing", () => {
     expect(getPackets).toHaveBeenCalledTimes(1);
     expect(result.current.laggedCount).toBe(5);
   });
+
+  it("skips the lag reset while the API is rate-limiting us, but still counts the drop", async () => {
+    const { result } = renderHook(() => usePackets(), { wrapper });
+    await waitFor(() => expect(getPackets).toHaveBeenCalledTimes(1));
+
+    seedThreePages(qc);
+    getPackets.mockClear();
+    noteRateLimited(10_000);
+    act(() => {
+      result.current.handleLagged({ v: 1, type: "lagged", droppedCount: 5, since: 0, lastObservationId: 0 });
+    });
+    noteRequestOk();
+
+    expect(getPackets).not.toHaveBeenCalled();
+    expect(qc.getQueryData<{ pages: unknown[] }>(["packets", "YOW"])?.pages).toHaveLength(3);
+    expect(result.current.laggedCount).toBe(5);
+  });
 });
 
 describe("usePackets server filter", () => {
@@ -92,7 +113,7 @@ describe("usePackets server filter", () => {
 
   beforeEach(() => {
     getPackets.mockReset();
-    getPackets.mockResolvedValue({ items: [packet("fresh")], nextCursor: 999 });
+    getPackets.mockResolvedValue({ items: [packet("fresh")], nextCursor: 999, hasMore: true });
     qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   });
 
@@ -197,11 +218,11 @@ describe("usePackets server filter", () => {
 
     qc.setQueryData(["packets", "YOW", { payloadType: 4 }], {
       pages: [
-        { items: [packet("a1")], nextCursor: 200 },
-        { items: [packet("b2")], nextCursor: 100 },
-        { items: [packet("c3")], nextCursor: null },
+        { items: [packet("a1")], nextCursor: 200, hasMore: true },
+        { items: [packet("b2")], nextCursor: 100, hasMore: true },
+        { items: [packet("c3")], nextCursor: null, hasMore: false },
       ],
-      pageParams: [undefined, 200, 100],
+      pageParams: [undefined, { cursor: 200 }, { cursor: 100 }],
     });
     getPackets.mockClear();
     result.current.handleLagged({ v: 1, type: "lagged", droppedCount: 5, since: 0, lastObservationId: 0 });
@@ -240,8 +261,13 @@ describe("usePackets path and endpoint fields", () => {
     <QueryClientProvider client={qc}>{children}</QueryClientProvider>
   );
 
-  it("carries path and endpoint fields from the WS observation into latestObserver", () => {
+  it("carries path and endpoint fields from the WS observation into latestObserver", async () => {
+    const history: PacketSummary = { ...packet("history"), latestObserver: {
+      id: "obs-rest", iata: "YVR", pathLength: { raw: "42", hashSize: 1, hopCount: 2 }, pathBytes: "7fa4",
+    } };
+    getPackets.mockResolvedValue({ items: [history], nextCursor: null });
     const { result } = renderHook(() => usePackets(false, undefined), { wrapper });
+    await waitFor(() => expect(result.current.allPackets).toHaveLength(1));
 
     act(() => {
       result.current.handlePacketObservation({
@@ -257,7 +283,7 @@ describe("usePackets path and endpoint fields", () => {
         observation: {
           observerId: "obs-1",
           observerName: "Raven",
-          iata: "YVR",
+          iata: "YOW",
           heardAt: 1700000000,
           rssi: -94,
           snr: -7.5,
@@ -276,6 +302,9 @@ describe("usePackets path and endpoint fields", () => {
     expect(obs?.pathBytes).toBe("7fa4");
     expect(obs?.resolvedSource?.nodes[0]!.name).toBe("Salish");
     expect(obs?.resolvedDestination).toBeUndefined();
+    const filters = { ...EMPTY_FILTERS, searchField: "path" as const, search: "7F A4" };
+    expect(result.current.allPackets.filter(p => matchesFilters(p, filters)).map(p => p.packetHash)).toEqual(["AA11", "history"]);
+    expect(result.current.allPackets.filter(p => matchesFilters(p, { ...filters, search: "ff" }))).toEqual([]);
   });
 });
 
@@ -332,6 +361,20 @@ describe("usePackets live heard window", () => {
 
   const flushRaf = () => rafCallbacks.splice(0).forEach((cb) => cb(0));
 
+  it("keeps summaries from history and passes summaries through live observations", async () => {
+    getPackets.mockResolvedValue({ items: [{ ...packet("history"), summary: "Historical advert" }], nextCursor: null });
+    const { result } = renderHook(() => usePackets(), { wrapper });
+    await waitFor(() => expect(result.current.allPackets.find((p) => p.packetHash === "history")?.summary).toBe("Historical advert"));
+    const event = observation("live");
+    event.packet.summary = "Live advert 📡";
+    act(() => {
+      result.current.handlePacketObservation(event);
+      flushRaf();
+    });
+    expect(result.current.allPackets.find((p) => p.packetHash === "live")?.summary).toBe("Live advert 📡");
+    expect(result.current.allPackets.find((p) => p.packetHash === "history")?.summary).toBe("Historical advert");
+  });
+
   // Each WS message carries only its own heardAt, so a second observation of the same packet used to
   // collapse the window to a single instant — the expanded row then read "spread 0.000s".
   it("widens the heard window across observations instead of collapsing it", async () => {
@@ -372,6 +415,44 @@ describe("usePackets live heard window", () => {
     const packet = result.current.allPackets.find((p) => p.packetHash === "p1")!;
     expect(packet.latestObserver?.id).toBe("o2");
     expect(packet.observationCount).toBe(2);
+  });
+
+  // the old subscription keeps delivering until the server takes the new one, after the buffer reset
+  it("drops observations from an IATA outside the current region", async () => {
+    Object.assign(region, { iatas: ["YVR"], regionKey: "YVR" });
+    try {
+      const { result } = renderHook(() => usePackets(), { wrapper });
+      await waitFor(() => expect(getPackets).toHaveBeenCalled());
+
+      act(() => {
+        result.current.handlePacketObservation(observation("stale"));
+        const fresh = observation("fresh");
+        fresh.observation.iata = "YVR";
+        result.current.handlePacketObservation(fresh);
+        flushRaf();
+      });
+
+      expect(result.current.allPackets.map((p) => p.packetHash)).toEqual(["fresh"]);
+    } finally {
+      Object.assign(region, { iatas: ["YOW"], regionKey: "YOW" });
+    }
+  });
+
+  it("keeps every observation when all regions are selected", async () => {
+    Object.assign(region, { iatas: undefined, regionKey: "*" });
+    try {
+      const { result } = renderHook(() => usePackets(), { wrapper });
+      await waitFor(() => expect(getPackets).toHaveBeenCalled());
+
+      act(() => {
+        result.current.handlePacketObservation(observation("any"));
+        flushRaf();
+      });
+
+      expect(result.current.allPackets.map((p) => p.packetHash)).toEqual(["any"]);
+    } finally {
+      Object.assign(region, { iatas: ["YOW"], regionKey: "YOW" });
+    }
   });
 });
 
@@ -460,5 +541,213 @@ describe("usePackets freeze while scrolled away", () => {
 
     act(() => result.current.acknowledgeNewPackets());
     expect(result.current.newPacketCount).toBe(0);
+  });
+});
+
+describe("usePackets while the region loads", () => {
+  afterEach(() => { Object.assign(region, { iatas: ["YOW"], regionKey: "YOW", isResolved: true }); });
+
+  it("fetches nothing until the region resolves, then fetches only its IATAs", async () => {
+    getPackets.mockReset();
+    getPackets.mockResolvedValue({ items: [], nextCursor: null });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+    Object.assign(region, { iatas: undefined, regionKey: "pending:onqc", isResolved: false });
+
+    const { result, rerender } = renderHook(() => usePackets(), { wrapper });
+    await new Promise((done) => setTimeout(done, 50));
+    expect(getPackets).not.toHaveBeenCalled();
+    expect(result.current.isLoading).toBe(true);
+
+    Object.assign(region, { iatas: ["YOW"], regionKey: "YOW", isResolved: true });
+    rerender();
+    await waitFor(() => expect(getPackets).toHaveBeenCalledWith(["YOW"], expect.anything()));
+  });
+});
+
+describe("usePackets deep paging", () => {
+  it("keeps the newest history page after many older pages load", async () => {
+    getPackets.mockReset();
+    getPackets.mockImplementation((_iatas: unknown, opts: { cursor?: number }) => {
+      const n = opts.cursor ?? 0;
+      return Promise.resolve({ items: [packet(`p${n}`)], nextCursor: n + 1, hasMore: true });
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => usePackets(), { wrapper });
+    await waitFor(() => expect(result.current.allPackets).toHaveLength(1));
+
+    for (let i = 1; i <= 25; i++) {
+      await act(() => result.current.fetchNextPage());
+    }
+
+    await waitFor(() => expect(result.current.allPackets).toHaveLength(26));
+    expect(result.current.allPackets[0]!.packetHash).toBe("p0");
+  });
+});
+
+describe("usePackets page cursors", () => {
+  let qc: QueryClient;
+
+  beforeEach(() => {
+    qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  });
+
+  afterEach(() => {
+    Object.assign(region, { iatas: ["YOW"], regionKey: "YOW", isResolved: true });
+  });
+
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+  );
+
+  it.each([
+    ["the global path", undefined, "*"],
+    ["a region", ["YOW", "YYZ"], "YOW,YYZ"],
+  ])("on %s, sends both cursors when the page has both", async (_label, iatas, regionKey) => {
+    Object.assign(region, { iatas, regionKey, isResolved: true });
+    getPackets.mockReset();
+    getPackets
+      .mockResolvedValueOnce({ items: [packet("p1")], nextCursor: 999, nextPageCursor: "v1:999123:ab", hasMore: true })
+      .mockResolvedValueOnce({ items: [packet("p2")], nextCursor: null, hasMore: false });
+    const { result } = renderHook(() => usePackets(), { wrapper });
+    await waitFor(() => expect(getPackets).toHaveBeenCalledTimes(1));
+    await act(async () => { await result.current.fetchNextPage(); });
+    expect(getPackets.mock.calls[1]![0]).toEqual(iatas);
+    expect(getPackets.mock.calls[1]![1]).toEqual({ cursor: 999, pageCursor: "v1:999123:ab" });
+  });
+
+  it.each([["the global path", undefined, "*"], ["a region", ["YOW", "YYZ"], "YOW,YYZ"]])(
+    "on %s, a page without nextPageCursor pages by cursor only", async (_label, iatas, regionKey) => {
+    Object.assign(region, { iatas, regionKey, isResolved: true });
+    getPackets.mockReset();
+    getPackets
+      .mockResolvedValueOnce({ items: [packet("p1")], nextCursor: 999, hasMore: true })
+      .mockResolvedValueOnce({ items: [packet("p2")], nextCursor: null, hasMore: false });
+    const { result } = renderHook(() => usePackets(), { wrapper });
+    await waitFor(() => expect(getPackets).toHaveBeenCalledTimes(1));
+    await act(async () => { await result.current.fetchNextPage(); });
+    expect(getPackets.mock.calls[1]![1].pageCursor).toBeUndefined();
+    expect(getPackets.mock.calls[1]![1].cursor).toBe(999);
+  });
+
+  it.each([["the global path", undefined, "*"], ["a region", ["YOW", "YYZ"], "YOW,YYZ"]])(
+    "on %s, pages forward on a server that ignores pageCursor and shows a repeated packet once", async (_label, iatas, regionKey) => {
+    Object.assign(region, { iatas, regionKey, isResolved: true });
+    getPackets.mockReset();
+    getPackets.mockImplementation((_i: unknown, opts: { cursor?: number }) => Promise.resolve(opts.cursor === undefined
+      ? { items: [packet("p1"), packet("p2")], nextCursor: 999, nextPageCursor: "v1:999123:ab", hasMore: true }
+      : { items: [packet("p2"), packet("p3")], nextCursor: null, hasMore: false }));
+    const { result } = renderHook(() => usePackets(), { wrapper });
+    await waitFor(() => expect(result.current.allPackets).toHaveLength(2));
+    await act(async () => { await result.current.fetchNextPage(); });
+    await waitFor(() => expect(result.current.allPackets.map((p) => p.packetHash)).toEqual(["p1", "p2", "p3"]));
+    expect(result.current.hasNextPage).toBe(false);
+  });
+  it("retries the next page by cursor alone when the server rejects the pageCursor", async () => {
+    getPackets.mockReset();
+    getPackets
+      .mockResolvedValueOnce({ items: [packet("p1")], nextCursor: 999, nextPageCursor: "v1:999123:ab", hasMore: true })
+      .mockRejectedValueOnce(Object.assign(new Error("invalid pageCursor"), { status: 400, code: "bad_request" }))
+      .mockResolvedValueOnce({ items: [packet("p2")], nextCursor: null, hasMore: false });
+    const { result } = renderHook(() => usePackets(), { wrapper });
+    await waitFor(() => expect(getPackets).toHaveBeenCalledTimes(1));
+    await act(async () => { await result.current.fetchNextPage(); });
+    expect(getPackets.mock.calls[1]![1]).toEqual({ cursor: 999, pageCursor: "v1:999123:ab" });
+    expect(getPackets.mock.calls[2]![1]).toStrictEqual({ cursor: 999, pageCursor: undefined });
+    await waitFor(() => expect(result.current.allPackets.map((p) => p.packetHash)).toEqual(["p1", "p2"]));
+    expect(result.current.isError).toBe(false);
+  });
+});
+
+describe("usePackets lag merge", () => {
+  let qc: QueryClient;
+  let rafCallbacks: FrameRequestCallback[];
+  const lag = { v: 1, type: "lagged", droppedCount: 0, since: 0, lastObservationId: 0 } as const;
+
+  beforeEach(() => {
+    getPackets.mockReset();
+    getPackets.mockResolvedValue({ items: [], nextCursor: null });
+    qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    rafCallbacks = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      rafCallbacks.push(cb);
+      return rafCallbacks.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    region.iatas = ["YOW"];
+    region.regionKey = "YOW";
+  });
+
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+  );
+  const flushRaf = () => rafCallbacks.splice(0).forEach((cb) => cb(0));
+
+  // A mounted list holding three loaded pages, its mount fetch settled.
+  async function scrolledList() {
+    const view = renderHook(() => usePackets(), { wrapper });
+    await waitFor(() => expect(view.result.current.isFetching).toBe(false));
+    seedThreePages(qc);
+    getPackets.mockClear();
+    return view;
+  }
+  const hashes = (r: { current: ReturnType<typeof usePackets> }) => r.current.allPackets.map((p) => p.packetHash);
+  const pages = () => qc.getQueryData<{ pages: unknown[] }>(["packets", "YOW"])?.pages;
+
+  it("slots the missed packets in above a list the newest page overlaps, keeping its pages", async () => {
+    const { result } = await scrolledList();
+    getPackets.mockResolvedValue({ items: [packet("new2"), packet("new1"), packet("a1")], nextCursor: 999, hasMore: true });
+    await act(async () => {
+      await result.current.handleLagged(lag);
+    });
+    act(() => flushRaf());
+    expect(hashes(result)).toEqual(["new2", "new1", "a1", "b2", "c3"]);
+    expect(pages()).toHaveLength(3);
+    expect(getPackets).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts over from the newest page alone when it leaves a hole", async () => {
+    const { result } = await scrolledList();
+    getPackets.mockResolvedValue({ items: [packet("new2"), packet("new1")], nextCursor: 999, hasMore: true });
+    await act(async () => {
+      await result.current.handleLagged(lag);
+    });
+    act(() => flushRaf());
+    expect(pages()).toHaveLength(1);
+    expect(hashes(result)).toEqual(["new2", "new1"]);
+    expect(getPackets).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the list when the newest page can't be fetched", async () => {
+    const { result } = await scrolledList();
+    getPackets.mockRejectedValue(new Error("down"));
+    await act(async () => {
+      await result.current.handleLagged(lag);
+    });
+    expect(pages()).toHaveLength(3);
+    expect(hashes(result)).toEqual(["a1", "b2", "c3"]);
+  });
+
+  it("drops a merge that lands after the region changed", async () => {
+    const { result, rerender } = await scrolledList();
+    let resolve!: (page: unknown) => void;
+    getPackets.mockReturnValueOnce(new Promise((r) => (resolve = r)));
+    const healing = result.current.handleLagged(lag);
+    region.iatas = ["YUL"];
+    region.regionKey = "YUL";
+    rerender();
+    await act(async () => {
+      resolve({ items: [packet("new1"), packet("a1")], nextCursor: 999, hasMore: true });
+      await healing;
+    });
+    act(() => flushRaf());
+    expect(hashes(result)).not.toContain("new1");
   });
 });

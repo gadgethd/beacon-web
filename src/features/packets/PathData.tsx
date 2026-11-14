@@ -1,9 +1,11 @@
 import { useRef, useState, useEffect, useLayoutEffect, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
 import { useHasHover } from "../../hooks/useMediaQuery";
 import { formatSnr, snrLevel, SIGNAL_LEVEL_CLASSES } from "../../lib/formatters";
 import type { ResolvedHop, ResolvedNode } from "../../types/api";
 import type { PathConfidence } from "../../types/enums";
+import { EmojiText } from "../../components/EmojiText";
 
 // hash block tint by resolution confidence
 const HOP_BLOCK_CLASSES: Record<PathConfidence, string> = {
@@ -17,12 +19,13 @@ function nodeLabel(node: ResolvedNode): string {
 }
 
 // Portals to <body> so the drawer's overflow doesn't clip it; a close delay bridges the mouse gap.
-function HopPopover({ hop, onViewNode, showSnr = true, children }: {
+export function HopPopover({ hop, onViewNode, showSnr = true, children }: {
   hop: ResolvedHop | undefined;
   onViewNode?: (nodeId: string) => void;
   showSnr?: boolean;
   children: ReactNode;
 }) {
+  const { t } = useTranslation();
   const hasHover = useHasHover();
   const ref = useRef<HTMLSpanElement>(null);
   const tipRef = useRef<HTMLSpanElement>(null);
@@ -94,7 +97,7 @@ function HopPopover({ hop, onViewNode, showSnr = true, children }: {
       onMouseEnter={hasHover ? open : undefined}
       onMouseLeave={hasHover ? scheduleClose : undefined}
       onClick={hasHover ? undefined : toggle}
-      className="inline-flex"
+      className="inline-flex min-w-0 max-w-full"
     >
       {children}
       {anchor &&
@@ -108,7 +111,7 @@ function HopPopover({ hop, onViewNode, showSnr = true, children }: {
             className={`fixed z-50 flex flex-col gap-0.5 whitespace-nowrap rounded border border-border bg-bg-raised px-2 py-1 font-mono text-[11px] text-text-normal shadow-lg ${clickable ? "" : "pointer-events-none"}`}
           >
             {nodes.length === 0 ? (
-              "No Path Resolutions Available"
+              t("packetRow.noResolution")
             ) : clickable ? (
               nodes.map((node) => (
                 <button
@@ -121,11 +124,11 @@ function HopPopover({ hop, onViewNode, showSnr = true, children }: {
                   }}
                   className="cursor-pointer text-left hover:text-primary hover:underline"
                 >
-                  {nodeLabel(node)}
+                  <EmojiText text={nodeLabel(node)} />
                 </button>
               ))
             ) : (
-              nodes.map((node) => <span key={node.id}>{nodeLabel(node)}</span>)
+              nodes.map((node) => <span key={node.id}><EmojiText text={nodeLabel(node)} /></span>)
             )}
             {showSnr && hop?.snr != null && (
               <span className="text-text-dim">
@@ -171,13 +174,22 @@ export function ResolvedHopBlock({ hop, label, onViewNode, showSnr = true }: {
   );
 }
 
+// SNR sub-line under a trace hop; a "-" placeholder keeps the row aligned when there's no reading.
+export function HopSnr({ snr }: { snr: number | undefined }) {
+  if (snr == null) return <span className="text-[11px] text-text-dim" aria-hidden>-</span>;
+  const level = snrLevel(snr);
+  return <span className={`text-[11px] ${level ? SIGNAL_LEVEL_CLASSES[level] : "text-text-normal"}`}>{formatSnr(snr)} dB</span>;
+}
+
 // resolvedPath[i] lines up with the i-th hash (backend appends one hop per hash, in order).
-export function PathData({ pathBytes, hashSize, resolvedPath, size = "md", onViewNode }: {
+// snrValues turns on the trace layout: each hop gets its SNR (or a placeholder) underneath.
+export function PathData({ pathBytes, hashSize, resolvedPath, size = "md", onViewNode, snrValues }: {
   pathBytes: string;
   hashSize: number;
   resolvedPath: ResolvedHop[];
   size?: "sm" | "md";
   onViewNode?: (nodeId: string) => void;
+  snrValues?: number[];
 }) {
   const chars = hashSize * 2;
   if (chars <= 0) return null; // splitter would be an invalid `.{1,0}` RegExp, and there's nothing to show anyway
@@ -185,13 +197,21 @@ export function PathData({ pathBytes, hashSize, resolvedPath, size = "md", onVie
   const textClass = size === "sm" ? "text-[11px]" : "text-[13px]";
 
   return (
-    <div className={`flex flex-wrap items-center gap-1 font-mono ${textClass}`}>
-      {hops.map((hop, i) => (
-        <span key={i} className="contents">
-          {i > 0 && <span className="text-text-dim" aria-hidden>→</span>}
-          <ResolvedHopBlock hop={resolvedPath[i]} label={hop.toUpperCase()} onViewNode={onViewNode} />
-        </span>
-      ))}
+    <div className={`flex flex-wrap items-center gap-1 font-mono ${textClass} ${snrValues ? "gap-y-2" : ""}`}>
+      {hops.map((hop, i) => {
+        const block = <ResolvedHopBlock hop={resolvedPath[i]} label={hop.toUpperCase()} onViewNode={onViewNode} showSnr={!snrValues} />;
+        return (
+          <span key={i} className="contents">
+            {i > 0 && <span className="text-text-dim" aria-hidden>→</span>}
+            {snrValues ? (
+              <span className="inline-flex flex-col items-center gap-0.5">
+                {block}
+                <HopSnr snr={snrValues[i]} />
+              </span>
+            ) : block}
+          </span>
+        );
+      })}
     </div>
   );
 }
