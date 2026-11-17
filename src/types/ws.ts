@@ -1,5 +1,6 @@
 import type { ChannelMessage } from "../features/channels/types";
 import type { NodeIATA } from "../features/nodes/types";
+import type { PathLength, ResolvedHop } from "./api";
 
 // individual server-sent message shapes
 
@@ -29,6 +30,16 @@ export interface WsPong {
   id: string;
 }
 
+export interface WsConfigured {
+  v: 1;
+  type: "configured";
+  id: string;
+  resolvePath: boolean;
+  // echoed by servers that support these opt-ins; we never set them
+  includeObserverKey?: boolean;
+  includeRepeats?: boolean;
+}
+
 export interface WsPacketObservation {
   v: 1;
   type: "event";
@@ -43,15 +54,27 @@ export interface WsPacketObservation {
       isFirstObservation: boolean;
       observationCount: number;
       scope?: string; // matched transport scope name; omitted when none matched
+      summary?: string;
+      // later hearing over a new path, only sent to configure{includeRepeats}; observationCount is 0
+      isRepeat?: boolean;
     };
     observation: {
       observerId: string;
       observerName: string;
+      observerPublicKey?: string; // only with configure{includeObserverKey}
       iata: string;
       heardAt: number;
       rssi: number;
       snr: number;
       sourceBroker: string;
+      pathLength?: PathLength;
+      pathBytes?: string;
+      // per-hop resolved path; populated only when the connection opts in via configure{resolvePath},
+      // null otherwise. Same shape as the REST Observation.resolvedPath.
+      resolvedPath?: ResolvedHop[] | null;
+      // the packet's logical endpoints, same shape as REST; null when the payload type carries none.
+      resolvedSource?: ResolvedHop | null;
+      resolvedDestination?: ResolvedHop | null;
     };
   };
 }
@@ -84,10 +107,12 @@ export interface WsNodeUpdate {
     name: string;
     nodeType: number;
     nodeTypeName: string;
+    // Omitted leaves the prior verdict unchanged; null clears an unknown/reset position.
+    possiblyForeign?: boolean | null;
     iata: string;
-    // decimal degrees, same as REST /nodes (api/nodes.go serializes *float64 degrees to both)
-    lat?: number;
-    lng?: number;
+    // decimal degrees as in REST /nodes; omitted keeps the prior position, null clears it (explicit 0/0 advert)
+    lat?: number | null;
+    lng?: number | null;
     isObserver: boolean;
     iatas: NodeIATA[];
     defaultScope?: string;
@@ -124,6 +149,7 @@ export type WsServerMessage =
   | WsSubscribed
   | WsUnsubscribed
   | WsPong
+  | WsConfigured
   | WsPacketObservation
   | WsObserverStatus
   | WsNodeUpdate

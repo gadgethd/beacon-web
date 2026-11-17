@@ -1,11 +1,14 @@
-import { useState, useRef, useEffect, useLayoutEffect, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { useState, useRef, useEffect, useId, useLayoutEffect, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useHasHover } from "../hooks/useMediaQuery";
 
 // Portals to <body> with fixed positioning so overflow parents (the data tables) can't clip it.
 // Hover reveals with a mouse; on touch it toggles on tap and dismisses on an outside tap.
-export function Tooltip({ label, children, className = "" }: { label: ReactNode; children: ReactNode; className?: string }) {
+// `focusable` makes a non-interactive trigger a tab stop whose label is exposed to screen readers.
+// `hideOnPress` drops the tip when the trigger is pressed, for one that then moves (a drag handle).
+export function Tooltip({ label, children, className = "", wrap = false, focusable = false, hideOnPress = false }: { label: ReactNode; children: ReactNode; className?: string; wrap?: boolean; focusable?: boolean; hideOnPress?: boolean }) {
   const hasHover = useHasHover();
+  const descId = useId();
   const ref = useRef<HTMLSpanElement>(null);
   const tipRef = useRef<HTMLSpanElement>(null);
   const [anchor, setAnchor] = useState<DOMRect | null>(null);
@@ -60,16 +63,22 @@ export function Tooltip({ label, children, className = "" }: { label: ReactNode;
       onMouseEnter={hasHover ? show : undefined}
       onMouseLeave={hasHover ? hide : undefined}
       onClick={hasHover ? undefined : toggle}
+      onFocus={hasHover ? show : undefined}
+      onBlur={hasHover ? hide : undefined}
+      onPointerDown={hasHover && hideOnPress ? hide : undefined}
+      tabIndex={focusable ? 0 : undefined}
+      aria-describedby={focusable ? descId : undefined}
       className={`inline-flex ${className}`}
     >
       {children}
+      {focusable && <span id={descId} hidden>{label}</span>}
       {anchor &&
         createPortal(
           <span
             ref={tipRef}
             role="tooltip"
             style={{ left: pos.left, top: pos.top }}
-            className="fixed z-50 pointer-events-none whitespace-nowrap rounded border border-border bg-bg-raised px-2 py-1 font-mono text-[11px] text-text-normal shadow-lg"
+            className={`fixed z-50 pointer-events-none ${wrap ? "max-w-xs whitespace-normal leading-relaxed" : "whitespace-nowrap"} rounded border border-border bg-bg-raised px-2 py-1 font-mono text-[11px] text-text-normal shadow-lg`}
           >
             {label}
           </span>,

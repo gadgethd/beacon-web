@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { patchNodeSummary, upsertNodePages } from "../../../src/features/nodes/node-updates";
+import { patchNodePages, patchNodeSummary, upsertNodePages } from "../../../src/features/nodes/node-updates";
+import { patchInfinitePages } from "../../../src/lib/infinite-pages";
 import type { NodeSummary } from "../../../src/features/nodes/types";
 import type { WsNodeUpdate } from "../../../src/types/ws";
 import type { InfiniteData } from "@tanstack/react-query";
@@ -24,6 +25,20 @@ function update(overrides: Partial<WsNodeUpdate["data"]>): WsNodeUpdate["data"] 
 }
 
 describe("patchNodeSummary", () => {
+  it("applies foreign status changes without moving coordinates and clears explicit null", () => {
+    const list = [node({ id: "a", name: "Keep", lat: 10, lng: 20, possiblyForeign: true })];
+    const local = patchNodeSummary(list, update({ nodeId: "a", name: "Keep", lat: 10, lng: 20, possiblyForeign: false }))!;
+    expect(local[0]!.possiblyForeign).toBe(false);
+    expect(local).not.toBe(list);
+    const unknown = patchNodeSummary(local, update({ nodeId: "a", name: "Keep", lat: 0, lng: 0, possiblyForeign: null }))!;
+    expect(unknown[0]!.possiblyForeign).toBeUndefined();
+    expect(list[0]!.possiblyForeign).toBe(true);
+  });
+
+  it("retains the flag and list identity when an advert omits the position/classification", () => {
+    const list = [node({ id: "a", name: "Keep", lat: 10, lng: 20, possiblyForeign: true })];
+    expect(patchNodeSummary(list, update({ nodeId: "a", name: "Keep", lat: undefined, lng: undefined }))).toBe(list);
+  });
   it("returns the list unchanged (same ref) when it is undefined", () => {
     expect(patchNodeSummary(undefined, update({}))).toBeUndefined();
   });
@@ -54,6 +69,19 @@ describe("patchNodeSummary", () => {
     expect(out[0]!.lng).toBe(20);
   });
 
+  it("clears the position when the update sends explicit null", () => {
+    const list = [node({ id: "a", lat: 10, lng: 20 })];
+    const out = patchNodeSummary(list, update({ nodeId: "a", lat: null, lng: null }))!;
+    expect(out).not.toBe(list);
+    expect(out[0]!.lat).toBeNull();
+    expect(out[0]!.lng).toBeNull();
+  });
+
+  it("returns the same ref when a null clear hits a node that is already unlocated", () => {
+    const list = [node({ id: "a", name: "Keep", lat: null, lng: null })];
+    expect(patchNodeSummary(list, update({ nodeId: "a", name: "Keep", lat: null, lng: null }))).toBe(list);
+  });
+
   it("returns the same list ref when the update changes nothing (no needless repaint)", () => {
     const list = [node({ id: "a", name: "Keep", lat: 10, lng: 20 })];
     // re-advert with identical name + omitted coords: every field resolves back to the prev value
@@ -65,6 +93,43 @@ describe("patchNodeSummary", () => {
     const list = [node({ id: "a", name: "Keep", lat: 10, lng: 20 })];
     const out = patchNodeSummary(list, update({ nodeId: "a", name: "", lat: 10, lng: 20 }));
     expect(out).toBe(list);
+  });
+});
+
+describe("patchNodePages", () => {
+  const cache = (pages: NodeSummary[][]): InfiniteData<CursorPage<NodeSummary>> => ({
+    pages: pages.map((items, i) => ({ items, nextCursor: i + 1, hasMore: i < pages.length - 1 })),
+    pageParams: pages.map(() => undefined),
+  });
+
+  it("patches only the page holding the node, as patching every page would", () => {
+    const old = cache([[node({ id: "a" }), node({ id: "b" })], [node({ id: "c" })], [node({ id: "d" })]]);
+    const patched = patchNodePages(old, update({ nodeId: "c", name: "Renamed" }))!;
+    expect(patched).toEqual(patchInfinitePages(old, (items) => patchNodeSummary(items, update({ nodeId: "c", name: "Renamed" })) ?? items));
+    expect(patched.pages[1]!.items[0]!.name).toBe("Renamed");
+    expect(patched.pages[0]).toBe(old.pages[0]);
+    expect(patched.pages[2]).toBe(old.pages[2]);
+    const again = patchNodePages(patched, update({ nodeId: "c", name: "Twice" }))!;
+    expect(again.pages[1]!.items[0]!.name).toBe("Twice");
+  });
+
+  it("returns the same cache for an unknown node or an unchanged re-advert", () => {
+    const old = cache([[node({ id: "a", name: "Keep" })]]);
+    expect(patchNodePages(old, update({ nodeId: "zz" }))).toBe(old);
+    expect(patchNodePages(old, update({ nodeId: "a", name: "Keep", lat: undefined, lng: undefined }))).toBe(old);
+    expect(patchNodePages(undefined, update({}))).toBeUndefined();
+  });
+
+  it("moves lastSeen up to the arrival time only when given one", () => {
+    const same = update({ nodeId: "a", name: "Keep", lat: undefined, lng: undefined });
+    const old = cache([[node({ id: "a", name: "Keep", lastSeen: 1_000 })], [node({ id: "b", lastSeen: 500 })]]);
+    const bumped = patchNodePages(old, same, 5_000)!;
+    expect(bumped.pages[0]!.items[0]!.lastSeen).toBe(5_000);
+    expect(bumped.pages[1]).toBe(old.pages[1]);
+    expect(patchNodePages(old, same)).toBe(old); // the map passes no time
+    expect(patchNodePages(bumped, same, 4_000)).toBe(bumped); // never back in time
+    const bare = cache([[node({ id: "a", name: "Keep" })]]);
+    expect(patchNodePages(bare, same, 5_000)).toBe(bare); // rows from a server without lastSeen
   });
 });
 
@@ -84,12 +149,12 @@ describe("upsertNodePages", () => {
     const old = pages([node({ id: "a" })], [node({ id: "b" })]);
     const out = upsertNodePages(
       old,
-      update({ nodeId: "new1", name: "Fresh", nodeTypeName: "companion", publicKey: "pk2", lat: 50.5, lng: -100.25, isObserver: false, iatas: [] }),
+      update({ nodeId: "new1", name: "Fresh", nodeTypeName: "repeater", publicKey: "pk2", lat: 50.5, lng: -100.25, isObserver: false, iatas: [], possiblyForeign: true }),
     )!;
     expect(out).not.toBe(old);
     expect(out.pages[0]).toBe(old.pages[0]); // earlier pages keep their refs
     expect(out.pages[1]!.items.map((n) => n.id)).toEqual(["b", "new1"]);
-    expect(out.pages[1]!.items[1]).toMatchObject({ name: "Fresh", lat: 50.5, lng: -100.25 });
+    expect(out.pages[1]!.items[1]).toMatchObject({ name: "Fresh", lat: 50.5, lng: -100.25, possiblyForeign: true });
   });
 
   it("keeps the same ref for a re-advert that changes nothing", () => {
@@ -99,5 +164,11 @@ describe("upsertNodePages", () => {
 
   it("passes undefined caches through", () => {
     expect(upsertNodePages(undefined, update({}))).toBeUndefined();
+  });
+
+  it("inserts a fresh node with an explicit null position", () => {
+    const old = pages([node({ id: "a" })]);
+    const out = upsertNodePages(old, update({ nodeId: "new1", lat: null, lng: null }))!;
+    expect(out.pages[0]!.items[1]).toMatchObject({ id: "new1", lat: null, lng: null });
   });
 });

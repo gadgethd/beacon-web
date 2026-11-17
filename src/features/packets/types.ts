@@ -11,6 +11,14 @@ export interface PacketFilterState {
   searchField: SearchField;
 }
 
+// Filters /packets history can apply server-side; each accepts multiple comma-separated values.
+export interface PacketServerFilter {
+  payloadTypes?: number[];
+  routeTypes?: number[];
+  scopes?: string[];
+  hashPrefix?: string;
+}
+
 export const EMPTY_FILTERS: PacketFilterState = {
   payloadTypes: [],
   routeTypes: [],

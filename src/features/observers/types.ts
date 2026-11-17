@@ -4,7 +4,7 @@ export interface ObserverSummary {
   observerType?: string;
   iata: string;
   status: "online" | "offline";
-  radio?: string; // compact "freq,bw,sf" string, e.g. "915.0,250,11"; absent when unknown
+  radio?: string; // compact "freq,bw,sf" string, e.g. "915,250,11"; absent when unknown
   scopes?: string[]; // transport scopes this observer forwards, e.g. ["#bc", "#west"]
   // epoch ms; not in REST list responses — patched in from WS status events for recency derivation
   lastStatusAt?: number;
@@ -48,4 +48,30 @@ export interface AdvertObservation {
   hopCount?: number;
   nodeName?: string;
   nodePublicKey?: string;
+}
+
+export type ObserverDirectorySort = "traffic" | "name";
+
+export interface ObserverDirectoryItem extends ObserverSummary {
+  observationCount: number | null;
+}
+
+export interface ObserverDirectoryPage {
+  items: ObserverDirectoryItem[];
+  nextCursor?: number;
+  hasMore: boolean;
+  generatedAt: number;
+  windowStart: number;
+  windowEnd: number;
+  sort: ObserverDirectorySort;
+  effectiveSort: ObserverDirectorySort;
+  coverage: {
+    status: "complete" | "partial" | "unavailable";
+    expectedHours: number;
+    completeHours: number;
+    partialHours: number;
+    missingHours: number;
+  };
+  maxObservationCount: number | null;
+  observerTypes: string[];
 }

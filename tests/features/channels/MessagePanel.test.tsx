@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MessagePanel } from "../../../src/features/channels/MessagePanel";
 import type { ChannelMessage, ChannelSummary } from "../../../src/features/channels/types";
+import i18n from "../../../src/i18n";
+import { getChannelMessagesPage } from "../../../src/api/client";
 
-// live WS messages have no id — mirror that runtime shape in the page data
+// Older live WS messages have no id — preserve that compatible runtime shape.
 const restMsg: ChannelMessage = {
   id: 1,
   packetHash: "ph-rest",
@@ -30,9 +32,20 @@ const liveMsgB = {
   sentAt: 3000,
 } as ChannelMessage;
 
+const multiLineMsg: ChannelMessage = {
+  id: 2,
+  packetHash: "ph-multiline",
+  channelHash: "ch1",
+  senderName: "dave",
+  content: "🟠\nDWD aktuell: WARNUNG vor GEWITTER\nDi 17:37 - Di 19:00",
+  sentAt: 4000,
+};
+
+vi.mock("../../../src/hooks/useRegion", () => ({ useRegion: () => ({ iatas: undefined, regionKey: "*" }) }));
 vi.mock("../../../src/api/client", () => ({
+  getScopes: vi.fn(async () => []),
   getChannelMessagesPage: vi.fn(() =>
-    Promise.resolve({ items: [restMsg, liveMsgA, liveMsgB], nextCursor: null, hasMore: false }),
+    Promise.resolve({ items: [restMsg, liveMsgA, liveMsgB, multiLineMsg], nextCursor: null, hasMore: false }),
   ),
 }));
 
@@ -68,5 +81,89 @@ describe("MessagePanel row keys", () => {
     expect(keyWarnings).toEqual([]);
 
     errorSpy.mockRestore();
+  });
+});
+
+describe("MessagePanel multi-line messages", () => {
+  it("preserves linebreaks in a message body", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={qc}>
+        <MessagePanel channel={channel} heardCounts={{}} regionKey="*" />
+      </QueryClientProvider>,
+    );
+
+    // jsdom doesn't collapse whitespace the way a browser does, so the class is what pins this;
+    // the body's leading emoji sits in its own span, so match the whole div's text, newlines intact
+    const body = await screen.findByText((_, el) => el?.tagName === "DIV" && el.textContent === multiLineMsg.content);
+    expect(body.className).toContain("whitespace-pre-wrap");
+    expect(body.className).toContain("break-words");
+    expect(body.querySelector(".emoji-glyph")).toHaveTextContent("🟠");
+  });
+});
+
+describe("MessagePanel heard badge", () => {
+  const mount = () => render(
+    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <MessagePanel channel={channel} heardCounts={{ "ph-rest": 3, "ph-live-a": 1 }} regionKey="*" />
+    </QueryClientProvider>,
+  );
+
+  it("labels the repeat count", async () => {
+    mount();
+    expect(await screen.findByTitle("Heard 3 times")).toHaveTextContent("×3");
+    expect(screen.getByTitle("Heard 1 time")).toBeInTheDocument();
+  });
+
+  it("labels the repeat count in French", async () => {
+    await i18n.changeLanguage("fr");
+    mount();
+    expect(await screen.findByTitle("Entendu 3 fois")).toBeInTheDocument();
+    expect(screen.getByTitle("Entendu 1 fois")).toBeInTheDocument();
+  });
+});
+
+describe("MessagePanel live follow", () => {
+  it("scrolls only its own list when a live message arrives, not the page", async () => {
+    const scrollTo = vi.fn();
+    window.HTMLElement.prototype.scrollTo = scrollTo as unknown as typeof HTMLElement.prototype.scrollTo;
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MessagePanel channel={channel} heardCounts={{}} regionKey="*" />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("live two");
+
+    const live = { ...liveMsgB, packetHash: "ph-live-c", content: "live three", sentAt: 5000 } as ChannelMessage;
+    act(() => {
+      qc.setQueryData(["channel-messages", channel.id, "*", ""], (old: { pages: { items: ChannelMessage[] }[] }) => ({
+        ...old,
+        pages: [{ ...old.pages[0], items: [live, ...old.pages[0].items] }, ...old.pages.slice(1)],
+      }));
+    });
+    await screen.findByText("live three");
+
+    // scrollIntoView also scrolls every ancestor up to the document, shoving the whole app shell up
+    expect(window.HTMLElement.prototype.scrollIntoView).not.toHaveBeenCalled();
+    expect(scrollTo).toHaveBeenCalled();
+  });
+});
+
+describe("MessagePanel load failure", () => {
+  it("shows the error and retry instead of the empty state", async () => {
+    await i18n.changeLanguage("en");
+    vi.mocked(getChannelMessagesPage).mockRejectedValueOnce(Object.assign(new Error("unavailable"), { status: 503 }));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MessagePanel channel={channel} heardCounts={{}} regionKey="*" scope="#ops" />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load messages.");
+    expect(screen.queryByText(/No messages/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("live two")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });

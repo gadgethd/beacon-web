@@ -4,7 +4,12 @@ import {
   WS_RECONNECT_BASE_MS,
   WS_RECONNECT_MAX_MS,
   WS_RECONNECT_JITTER,
+  WS_STABLE_MS,
+  WS_RECONNECT_GRACE_MS,
 } from "../lib/constants";
+
+// attempt index at which the backoff first reaches WS_RECONNECT_MAX_MS
+const CAP_ATTEMPT = Math.ceil(Math.log2(WS_RECONNECT_MAX_MS / WS_RECONNECT_BASE_MS));
 
 // handler types and status
 
@@ -21,16 +26,26 @@ export class WsManager {
   private ws: WebSocket | null = null;
   private url: string;
   private filter: SubscriptionFilter | null = null;
+  // connection-wide toggle for resolvedPath on packetObservation events; survives reconnect (like
+  // filter), re-applied on each hello. Default off keeps the event payload small.
+  private resolvePath = false;
   private subscriptionId: string | null = null;
   private lastSubscribeId: string | null = null;
   private everConnected = false;
   private status: WsStatus = "disconnected";
   private reconnectAttempt = 0;
+  private openedAt: number | null = null;
   private intentionalClose = false;
+  private paused = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  // while set, a reconnect's interim states wait in graceStatus instead of reaching listeners
+  private graceTimer: ReturnType<typeof setTimeout> | null = null;
+  private graceStatus: WsStatus = "connecting";
   private msgCounter = 0;
   private lastEventTimestamp: number = Date.now();
+  // liveness for the ping check; unlike lastEventTimestamp it restarts with each connection
+  private lastHeardAt: number = Date.now();
 
   private packetHandlers: PacketHandler[] = [];
   private laggedHandlers: LaggedHandler[] = [];
@@ -113,14 +128,41 @@ export class WsManager {
     this.sendSubscribe();
   }
 
+  // Enable/disable per-hop resolvedPath data on packetObservation events for the whole connection.
+  // Stored so it re-applies after a reconnect; sent immediately when the socket is already open.
+  setResolvePath(enabled: boolean): void {
+    if (this.resolvePath === enabled) return;
+    this.resolvePath = enabled;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.sendConfigure();
+    }
+  }
+
   disconnect(): void {
+    this.paused = false;
     this.intentionalClose = true;
     this.reconnectAttempt = 0;
+    this.openedAt = null;
     this.clearTimers();
     this.teardownSocket();
     this.subscriptionId = null;
     this.lastSubscribeId = null;
     this.setStatus("disconnected");
+  }
+
+  // Closes the socket for a hidden tab; resume() reopens it, and the reconnect's lag notice backfills.
+  pause(): void {
+    if (this.paused || !this.filter) return;
+    this.disconnect();
+    this.paused = true;
+  }
+
+  // Reopens a paused connection at once. Returns whether there was one to reopen.
+  resume(): boolean {
+    if (!this.paused) return false;
+    this.paused = false;
+    this.doConnect();
+    return true;
   }
 
   // exponential backoff w/ jitter to avoid thundering herd on reconnect
@@ -137,7 +179,7 @@ export class WsManager {
     this.ws = new WebSocket(this.url);
 
     this.ws.onopen = () => {
-      this.reconnectAttempt = 0;
+      this.openedAt = Date.now();
     };
 
     this.ws.onmessage = (e: MessageEvent) => {
@@ -151,14 +193,14 @@ export class WsManager {
       this.handleMessage(msg);
     };
 
-    this.ws.onclose = () => {
+    this.ws.onclose = (e: CloseEvent) => {
       this.clearTimers();
       if (this.intentionalClose) {
         this.setStatus("disconnected");
         return;
       }
       // any unexpected close — including a server-sent 1000 — gets a reconnect
-      this.scheduleReconnect();
+      this.scheduleReconnect(e.code);
     };
 
     this.ws.onerror = () => {
@@ -171,9 +213,11 @@ export class WsManager {
       case "hello": {
         const isReconnect = this.everConnected;
         this.everConnected = true;
+        this.lastHeardAt = Date.now();
         this.setStatus("connected");
         this.startPing();
         this.sendSubscribe();
+        if (this.resolvePath) this.sendConfigure(); // re-apply the connection-wide toggle
         if (isReconnect) {
           // we were dark during the outage — synthesize a lag notice so live views heal the gap
           const notice: WsLagged = { v: 1, type: "lagged", droppedCount: 0, since: this.lastEventTimestamp };
@@ -193,13 +237,17 @@ export class WsManager {
         }
         break;
 
+      case "configured":
+        // ack for our resolvePath toggle; nothing to do beyond the server now honoring it
+        break;
+
       case "pong":
         // a pong proves the link is alive, so it counts as recent activity
-        this.lastEventTimestamp = Date.now();
+        this.lastEventTimestamp = this.lastHeardAt = Date.now();
         break;
 
       case "event":
-        this.lastEventTimestamp = Date.now();
+        this.lastEventTimestamp = this.lastHeardAt = Date.now();
         if (msg.event === "packetObservation") {
           for (const handler of this.packetHandlers) {
             handler(msg.data);
@@ -221,7 +269,7 @@ export class WsManager {
 
       case "lagged":
         // a lag notice is still server traffic, so it counts as recent activity
-        this.lastEventTimestamp = Date.now();
+        this.lastEventTimestamp = this.lastHeardAt = Date.now();
         for (const handler of this.laggedHandlers) {
           handler(msg);
         }
@@ -233,7 +281,10 @@ export class WsManager {
   }
 
   private sendSubscribe(): void {
-    if (!this.filter) return;
+    // any subscribe still awaiting its ack is superseded, even when nothing replaces it
+    this.lastSubscribeId = null;
+    // the server reads an empty IATA list as "all", so a region with no IATAs subscribes to nothing
+    if (!this.filter || this.filter.iatas?.length === 0) return;
     const id = `sub-${this.nextId()}`;
     this.lastSubscribeId = id;
     this.send({
@@ -244,10 +295,14 @@ export class WsManager {
     });
   }
 
+  private sendConfigure(): void {
+    this.send({ v: 1, type: "configure", id: `cfg-${this.nextId()}`, resolvePath: this.resolvePath });
+  }
+
   private startPing(): void {
     if (this.pingTimer) clearInterval(this.pingTimer); // a second hello must not double the interval
     this.pingTimer = setInterval(() => {
-      if (Date.now() - this.lastEventTimestamp > WS_PING_INTERVAL_MS * 2 + 5_000) {
+      if (Date.now() - this.lastHeardAt > WS_PING_INTERVAL_MS * 2 + 5_000) {
         // pongs stopped coming back — the link is half-open, rebuild it
         this.forceReconnect();
         return;
@@ -264,8 +319,15 @@ export class WsManager {
     this.scheduleReconnect();
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(closeCode?: number): void {
+    // only a link that actually held resets the backoff — an accept-then-close must keep escalating
+    const healthy = this.openedAt !== null && Date.now() - this.openedAt >= WS_STABLE_MS;
+    if (healthy) this.startGrace();
     this.setStatus("connecting");
+    if (healthy) this.reconnectAttempt = 0;
+    this.openedAt = null;
+    // 1008 policy / 1013 try-again-later mean the server is shedding us: go straight to the longest wait
+    if (closeCode === 1008 || closeCode === 1013) this.reconnectAttempt = Math.max(this.reconnectAttempt, CAP_ATTEMPT);
     const base = Math.min(WS_RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, WS_RECONNECT_MAX_MS);
     const jitter = base * WS_RECONNECT_JITTER * (Math.random() * 2 - 1);
     const delay = Math.max(base + jitter, 100);
@@ -289,11 +351,31 @@ export class WsManager {
   }
 
   private setStatus(status: WsStatus): void {
+    if (this.graceTimer && (status === "connecting" || status === "error")) {
+      this.graceStatus = status;
+      return;
+    }
+    this.endGrace();
     if (this.status === status) return;
     this.status = status;
     for (const handler of this.statusHandlers) {
       handler(status);
     }
+  }
+
+  private startGrace(): void {
+    if (this.graceTimer || this.status !== "connected") return;
+    this.graceStatus = "connecting";
+    this.graceTimer = setTimeout(() => {
+      this.graceTimer = null;
+      this.setStatus(this.graceStatus);
+    }, WS_RECONNECT_GRACE_MS);
+  }
+
+  private endGrace(): void {
+    if (!this.graceTimer) return;
+    clearTimeout(this.graceTimer);
+    this.graceTimer = null;
   }
 
   private teardownSocket(): void {

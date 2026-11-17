@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import maplibregl from "maplibre-gl";
-import type { Map as MapLibreMap, RasterDEMSourceSpecification } from "maplibre-gl";
+import { Map as MapLibreMap, NavigationControl, ScaleControl, AttributionControl, LngLatBounds } from "maplibre-gl";
+import type { RasterDEMSourceSpecification } from "maplibre-gl";
+import "./maplibre-worker";
+import i18n from "../../i18n";
 import {
   DEM_TILES,
   DEM_ATTRIBUTION,
@@ -15,9 +17,29 @@ import {
   resolveMapStyle,
 } from "./types";
 
+// MapLibre reads its control tooltips once at construction, so a language switch applies on next mount.
+export function mapLocale(): Record<string, string> {
+  return {
+    "AttributionControl.ToggleAttribution": i18n.t("map.controls.toggleAttribution"),
+    "AttributionControl.MapFeedback": i18n.t("map.controls.mapFeedback"),
+    "Map.Title": i18n.t("map.controls.map"),
+    "NavigationControl.ResetBearing": i18n.t("map.controls.resetBearing"),
+    "NavigationControl.ZoomIn": i18n.t("map.controls.zoomIn"),
+    "NavigationControl.ZoomOut": i18n.t("map.controls.zoomOut"),
+    "Popup.Close": i18n.t("map.controls.closePopup"),
+  };
+}
+
 // serialized fit target, so the fit effect can skip redundant re-fits
 const fitKey = (points: [number, number][] | null) =>
   points && points.length ? points.map((p) => `${p[0]},${p[1]}`).join(";") : null;
+
+// Sprite/glyph fetches fail with their own url; only a urlless error (parse/validation) or one for the
+// style document itself means the style won't load.
+function isStyleLoadFailure(error: unknown, styleUrl: string): boolean {
+  const url = (error as { url?: unknown } | undefined)?.url;
+  return typeof url !== "string" || url === styleUrl;
+}
 
 // Keeps the imperative MapLibre lifecycle out of MapView; exposes mapRef + isReady for overlays.
 
@@ -62,11 +84,32 @@ function addTerrain(map: MapLibreMap, isDark: boolean) {
   map.setTerrain({ source: TERRAIN_SOURCE_ID, exaggeration: TERRAIN_EXAGGERATION });
 }
 
+// Drops the DEM sources so no elevation tile is fetched while terrain is off; terrain and the layer
+// let go of their sources first, since maplibre won't remove a source still in use.
+function removeTerrain(map: MapLibreMap) {
+  if (map.getTerrain()) map.setTerrain(null);
+  if (map.getLayer(HILLSHADE_LAYER_ID)) map.removeLayer(HILLSHADE_LAYER_ID);
+  if (map.getSource(HILLSHADE_SOURCE_ID)) map.removeSource(HILLSHADE_SOURCE_ID);
+  if (map.getSource(TERRAIN_SOURCE_ID)) map.removeSource(TERRAIN_SOURCE_ID);
+}
+
+function syncTerrain(map: MapLibreMap, on: boolean, isDark: boolean) {
+  if (on) addTerrain(map, isDark);
+  else removeTerrain(map);
+}
+
 export function useMapLibre(
   styleId: string,
   // lng/lat pairs to fitBounds over; null/empty falls back to the configured default view
   fitPoints: [number, number][] | null,
   onStyleError?: (lastGoodStyleId: string) => void,
+  // a deep-link camera ([lng, lat] + zoom); when set it opens the map here and wins over the initial
+  // region fitBounds. Later region changes still auto-fit.
+  initialCamera?: { center: [number, number]; zoom: number },
+  // identity of the selection being framed; the deep-link camera only wins while it's unchanged
+  fitScope?: string,
+  // 3D terrain + hillshade; while off no DEM source exists, so no elevation tiles are fetched
+  terrain = false,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -75,8 +118,13 @@ export function useMapLibre(
   const lastGoodStyleIdRef = useRef(styleId); // last style that loaded; the revert target on a failed swap
   const hasLoadedRef = useRef(false); // a style has loaded at least once (distinguishes initial-load failure)
   const swapPendingRef = useRef(false); // a setStyle() basemap swap is in flight (awaiting style.load)
+  const nodeIconResolverRef = useRef<((id: string) => Promise<void>) | null>(null); // filled by useMapNodes
   const onStyleErrorRef = useRef(onStyleError);
   const lastFitKeyRef = useRef<string | null>(null); // last applied fit target; skips redundant re-fits
+  const skipInitialFitRef = useRef(!!initialCamera); // let a deep-link camera win over the first fit
+  const initialFitScopeRef = useRef(fitScope);
+  const initialCameraRef = useRef(initialCamera); // read once at map creation (deep link is load-time only)
+  const terrainRef = useRef(terrain);
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
@@ -96,23 +144,25 @@ export function useMapLibre(
     const container = containerRef.current;
     if (!container) return;
 
-    // open at the default view; the fit effect frames the selection once the style is ready
-    const map = new maplibregl.Map({
+    // open at the deep-link camera if one was given, else the default view; the fit effect frames the
+    // selection once the style is ready (unless a deep-link camera suppresses that first fit)
+    const map = new MapLibreMap({
       container,
       style: resolveMapStyle(styleIdRef.current).url,
-      center: DEFAULT_CENTER,
-      zoom: DEFAULT_ZOOM,
+      center: initialCameraRef.current?.center ?? DEFAULT_CENTER,
+      zoom: initialCameraRef.current?.zoom ?? DEFAULT_ZOOM,
       pitch: DEFAULT_PITCH,
       bearing: DEFAULT_BEARING,
       maxPitch: MAX_PITCH,
       attributionControl: false, // replaced below with a compact (always-collapsed) control
+      locale: mapLocale(),
     });
     mapRef.current = map;
     lastStyleIdRef.current = styleIdRef.current;
 
-    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
-    map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
-    map.addControl(new maplibregl.AttributionControl({ compact: true })); // bottom-right
+    map.addControl(new NavigationControl({ visualizePitch: true }), "top-right");
+    map.addControl(new ScaleControl({ unit: "metric" }), "bottom-left");
+    map.addControl(new AttributionControl({ compact: true })); // bottom-right
     // maplibre pops the compact attribution open the first time the basemap credit loads (it tacks
     // on .maplibregl-compact-show). Mark it .maplibregl-compact up front so it skips that and stays
     // a bare (i) on load — clicking it still opens the credit.
@@ -121,7 +171,7 @@ export function useMapLibre(
     attrib?.classList.remove("maplibregl-compact-show");
 
     const onStyleReady = () => {
-      addTerrain(map, resolveMapStyle(styleIdRef.current).dark);
+      syncTerrain(map, terrainRef.current, resolveMapStyle(styleIdRef.current).dark);
       hasLoadedRef.current = true;
       swapPendingRef.current = false;
       lastGoodStyleIdRef.current = styleIdRef.current;
@@ -129,24 +179,28 @@ export function useMapLibre(
       setError(null); // a successful (re)load clears any earlier transient/initial error
     };
     map.on("load", onStyleReady); // first paint (style.load does not reliably fire on initial load)
-    map.on("style.load", onStyleReady); // re-add terrain after every setStyle
+    map.on("style.load", onStyleReady); // re-add terrain (if on) after every setStyle
 
     // The OpenFreeMap base styles ask for a handful of sprite icons their sprite doesn't ship (e.g.
     // "circle-11"), so maplibre warns on every load. Hand it a transparent 1x1 for anything that
     // isn't ours and the noise goes away — a missing icon already draws nothing, so the map looks
     // identical. Our own markers all start with "node-" and are rasterized by useMapNodes, so we
-    // leave those alone. This lives here (not in useMapNodes) so it's listening before the base
+    // leave those alone. This lives here (not in useMapNodes) so it's installed before the base
     // style's first paint, when those icons are first requested.
-    map.on("styleimagemissing", (e) => {
-      if (!e.id.startsWith("node-") && !map.hasImage(e.id)) map.addImage(e.id, new ImageData(1, 1));
+    // maplibre allows one resolver per map, so node icons route through a slot useMapNodes fills.
+    map.setMissingStyleImageResolver((id) => {
+      if (id.startsWith("node-")) return nodeIconResolverRef.current?.(id);
+      if (!map.hasImage(id)) map.addImage(id, new ImageData(1, 1));
     });
 
     map.on("error", (e) => {
-      const err = e as { error?: Error; sourceId?: string; tile?: unknown };
+      const err = e as unknown as { error?: Error; sourceId?: string; tile?: unknown };
       // A single tile/source failure (one basemap or DEM tile timing out / 403 / a momentary network
       // blip) is transient and non-fatal — the rest of the map stays usable — so never blank the map
       // for it. maplibre tags tile/source errors with a tile/sourceId; style-level errors have neither.
       if (err.sourceId != null || err.tile != null) return;
+      // a sprite 404 mid-swap is non-fatal too; the new style still loads without its icons
+      if (swapPendingRef.current && !isStyleLoadFailure(err.error, resolveMapStyle(lastStyleIdRef.current).url)) return;
       // The new basemap failed mid-swap. setStyle keeps the old style (and our node layers)
       // rendered, so roll back to the last good style and tell MapView to revert the picker rather
       // than blanking the map under a fatal overlay.
@@ -182,12 +236,23 @@ export function useMapLibre(
     map.setStyle(resolveMapStyle(styleId).url);
   }, [styleId]);
 
+  // Apply the terrain switch. Mid-swap the ref alone carries it and style.load applies it; isReady
+  // re-runs this after a failed swap rolls back to the old style.
+  useEffect(() => {
+    terrainRef.current = terrain;
+    const map = mapRef.current;
+    if (!map || !isReady) return;
+    syncTerrain(map, terrain, resolveMapStyle(styleIdRef.current).dark);
+  }, [terrain, isReady]);
+
   // Frame the selection: fitBounds over its IATA points, or the default overview when there's none.
   // A single point gets the IATA_ZOOM terrain tilt; multiple get a flat overview. Waits for the
   // style, and the key check skips redundant re-fits (incl. isReady toggling on basemap swaps).
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !isReady) return;
+    // the linked region never got its fit (e.g. it has no coords); don't spend the skip on another one
+    if (fitScope !== initialFitScopeRef.current) skipInitialFitRef.current = false;
     const key = fitKey(fitPoints);
     if (key === lastFitKeyRef.current) return;
     lastFitKeyRef.current = key;
@@ -197,9 +262,16 @@ export function useMapLibre(
       return;
     }
 
+    // First real fit of the linked region: keep the URL-supplied view instead of framing it.
+    // Consumed once, so later region changes fit normally.
+    if (skipInitialFitRef.current) {
+      skipInitialFitRef.current = false;
+      return;
+    }
+
     const bounds = fitPoints.reduce(
       (b, p) => b.extend(p),
-      new maplibregl.LngLatBounds(fitPoints[0], fitPoints[0]),
+      new LngLatBounds(fitPoints[0], fitPoints[0]),
     );
     map.fitBounds(bounds, {
       padding: 48,
@@ -207,7 +279,7 @@ export function useMapLibre(
       pitch: fitPoints.length === 1 ? IATA_PITCH : DEFAULT_PITCH,
       bearing: DEFAULT_BEARING,
     });
-  }, [fitPoints, isReady]);
+  }, [fitPoints, isReady, fitScope]);
 
-  return { containerRef, mapRef, isReady, error };
+  return { containerRef, mapRef, isReady, error, nodeIconResolverRef };
 }

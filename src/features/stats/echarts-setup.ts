@@ -3,7 +3,7 @@
 // the `echarts-for-react` wrapper (it was hit by a supply-chain attack 2026-05-19); EChart.tsx wraps
 // the core API directly instead.
 import * as echarts from "echarts/core";
-import { LineChart, BarChart, PieChart, GaugeChart } from "echarts/charts";
+import { LineChart, BarChart, PieChart, GaugeChart, GraphChart, HeatmapChart } from "echarts/charts";
 import {
   GridComponent,
   TitleComponent,
@@ -12,14 +12,19 @@ import {
   GraphicComponent,
   DataZoomComponent,
   MarkLineComponent,
+  VisualMapComponent,
+  AriaComponent,
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
+import langFR from "echarts/lib/i18n/langFR.js";
 
 echarts.use([
   LineChart,
   BarChart,
   PieChart,
   GaugeChart,
+  GraphChart,
+  HeatmapChart,
   GridComponent,
   TitleComponent,
   TooltipComponent,
@@ -27,8 +32,13 @@ echarts.use([
   GraphicComponent,
   DataZoomComponent,
   MarkLineComponent,
+  VisualMapComponent,
+  AriaComponent,
   CanvasRenderer,
 ]);
+
+// time-axis month/day names; EN is built in
+echarts.registerLocale("FR", langFR);
 
 export { echarts };
 export type EChartsInstance = ReturnType<typeof echarts.init>;

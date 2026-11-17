@@ -1,23 +1,36 @@
 import { useCallback, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { useQuery, useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useMapLibre } from "./useMapLibre";
 import { useMapNodes } from "./useMapNodes";
+import { useMapNeighbors } from "./useMapNeighbors";
+import { useMapBorders } from "./useMapBorders";
+import { useMapBordersData } from "./useMapBordersData";
+import { useMapPacketFlow } from "./useMapPacketFlow";
+import { PacketFlowButton } from "./PacketFlowButton";
 import { useMapNodesData } from "./useMapNodesData";
-import { nodesToFeatureCollection, filterByNodeType } from "./node-geojson";
+import { nodesToFeatureCollection, filterByNodeType, buildNeighborEdges, buildFocusedNeighborEdges, neighborFocusIds, type NeighborEdgeProps } from "./node-geojson";
+import { buildLiveNodeIndex, idleDotTypes, withSelectedNode, liveNeighborLines } from "./live-map";
 import { MapSettingsPanel } from "./MapSettingsPanel";
-import { MAP_STYLE_STORAGE_KEY, DEFAULT_STYLE_ID, resolveMapStyle } from "./types";
+import { parseMapView, parseNodeType, buildMapParams, type MapViewSnapshot } from "./map-url";
+import { MAP_STYLE_STORAGE_KEY, DEFAULT_STYLE_ID, resolveMapStyle, MAP_NEIGHBOR_LINES_STORAGE_KEY, MAP_CLUSTER_STORAGE_KEY, MAP_NODE_TYPE_STORAGE_KEY, MAP_BORDERS_STORAGE_KEY, MAP_TERRAIN_STORAGE_KEY, DEFAULT_CENTER, DEFAULT_ZOOM, type NeighborLinesMode } from "./types";
+import type { FeatureCollection, LineString } from "geojson";
 import { EmptyState } from "../../components/EmptyState";
 import { LoadingPill } from "../../components/LoadingPill";
-import { useRegion } from "../../hooks/useRegion";
+import { useRegion, useRegionSelection } from "../../hooks/useRegion";
+import { serializeSelection } from "../../hooks/region-selection";
 import { useTheme } from "../../hooks/useTheme";
 import { useWsNodeUpdateHandler } from "../../hooks/useWsHandlers";
-import { getIatas } from "../../api/client";
+import { getIatas, getNodeNeighbors } from "../../api/client";
 import { upsertNodePages } from "../nodes/node-updates";
 import type { WsManager } from "../../api/ws-manager";
 import type { NodeSummary } from "../nodes/types";
 import type { CursorPage } from "../../types/api";
 import type { WsNodeUpdate } from "../../types/ws";
+
+const EMPTY_EDGES: FeatureCollection<LineString, NeighborEdgeProps> = { type: "FeatureCollection", features: [] };
 
 interface MapViewProps {
   wsManager: WsManager;
@@ -27,9 +40,16 @@ interface MapViewProps {
 }
 
 export function MapView({ wsManager, selectedNodeId, onSelectNode }: MapViewProps) {
+  const { t } = useTranslation();
+  // Deep-link params, read once at mount (like the region's ?iata seed). Each setting below is seeded
+  // URL -> localStorage -> default; the URL wins for this session but is never written back to
+  // localStorage, so a shared link can't clobber the visitor's saved prefs.
+  const [searchParams] = useSearchParams();
+  const [urlView] = useState(() => parseMapView(searchParams));
+
   // restore the saved style; resolveMapStyle falls back to the default if the stored id is stale
   const [styleId, setStyleId] = useState(
-    () => resolveMapStyle(localStorage.getItem(MAP_STYLE_STORAGE_KEY) ?? DEFAULT_STYLE_ID).id,
+    () => urlView.styleId ?? resolveMapStyle(localStorage.getItem(MAP_STYLE_STORAGE_KEY) ?? DEFAULT_STYLE_ID).id,
   );
 
   const handleStyleChange = useCallback((id: string) => {
@@ -44,10 +64,60 @@ export function MapView({ wsManager, selectedNodeId, onSelectNode }: MapViewProp
     localStorage.setItem(MAP_STYLE_STORAGE_KEY, lastGoodStyleId);
   }, []);
 
-  const [typeFilter, setTypeFilter] = useState(""); // "" = All
-  const [clustered, setClustered] = useState(true);
+  const [typeFilter, setTypeFilter] = useState(
+    () => urlView.nodeType ?? parseNodeType(localStorage.getItem(MAP_NODE_TYPE_STORAGE_KEY)) ?? "",
+  ); // "" = All
+  const handleTypeChange = useCallback((t: string) => {
+    setTypeFilter(t);
+    localStorage.setItem(MAP_NODE_TYPE_STORAGE_KEY, t);
+  }, []);
 
-  const { iatas: selectedIatas, regionKey } = useRegion();
+  const [clustered, setClustered] = useState(
+    () => urlView.clustered ?? localStorage.getItem(MAP_CLUSTER_STORAGE_KEY) !== "off",
+  );
+  const handleClusteredChange = useCallback((c: boolean) => {
+    setClustered(c);
+    localStorage.setItem(MAP_CLUSTER_STORAGE_KEY, c ? "on" : "off");
+  }, []);
+
+  const [neighborLines, setNeighborLines] = useState<NeighborLinesMode>(() => {
+    if (urlView.neighborLines) return urlView.neighborLines;
+    const stored = localStorage.getItem(MAP_NEIGHBOR_LINES_STORAGE_KEY);
+    return stored === "on" || stored === "selected" || stored === "off" ? stored : "selected";
+  });
+  const handleNeighborLinesChange = useCallback((mode: NeighborLinesMode) => {
+    setNeighborLines(mode);
+    localStorage.setItem(MAP_NEIGHBOR_LINES_STORAGE_KEY, mode);
+  }, []);
+
+  // live packet-flow animation: opt-in per session (off by default, not persisted; a deep link can seed it)
+  const [packetFlow, setPacketFlow] = useState(() => urlView.flow ?? false);
+  // what the map draws; the saved choice stays in neighborLines for the panel, storage and links
+  const shownNeighborLines = liveNeighborLines(neighborLines, packetFlow);
+
+  // IATA region borders overlay, off by default; seeded URL -> localStorage like the other toggles
+  const [borders, setBorders] = useState(() => urlView.borders ?? localStorage.getItem(MAP_BORDERS_STORAGE_KEY) === "on");
+  const handleBordersChange = useCallback((on: boolean) => {
+    setBorders(on);
+    localStorage.setItem(MAP_BORDERS_STORAGE_KEY, on ? "on" : "off");
+  }, []);
+
+  // 3D terrain + hillshade, off by default; a viewer preference, so localStorage only (not in links)
+  const [terrain, setTerrain] = useState(() => localStorage.getItem(MAP_TERRAIN_STORAGE_KEY) === "on");
+  const handleTerrainChange = useCallback((on: boolean) => {
+    setTerrain(on);
+    localStorage.setItem(MAP_TERRAIN_STORAGE_KEY, on ? "on" : "off");
+  }, []);
+
+  // A deep-link camera opens the map here and suppresses the initial region fit (see useMapLibre).
+  const initialCamera = useMemo(
+    () => (urlView.center ? { center: urlView.center, zoom: urlView.zoom ?? DEFAULT_ZOOM } : undefined),
+    [urlView],
+  );
+
+  const { iatas: selectedIatas, regionKey, isResolved } = useRegion();
+  const { selection } = useRegionSelection();
+  const regionPending = isResolved === false;
   const queryClient = useQueryClient();
   // marker/cluster icons are canvas-drawn from the active --palette-* vars, so useMapNodes has to
   // re-register them whenever the palette changes: on a theme switch, and once on load when the async
@@ -59,7 +129,7 @@ export function MapView({ wsManager, selectedNodeId, onSelectNode }: MapViewProp
   // nodes for the selected region (its own key, independent of the Nodes-table filters/page cap).
   // Pages in 50 at a time so the map fills batch by batch; nodesKey matches the hook's query key.
   const nodesKey = useMemo(() => ["map-nodes", regionKey], [regionKey]);
-  const { nodes, loadedCount, isPaging, isError: nodesError } = useMapNodesData(selectedIatas, regionKey);
+  const { nodes, loadedCount, isPaging, isError: nodesError } = useMapNodesData(selectedIatas, regionKey, { enabled: !regionPending });
 
   // patch-or-insert the live update into the paged node cache (the shared helper preserves refs
   // when nothing changed, so a same-values re-advert doesn't trigger a full map repaint); brand-new
@@ -82,21 +152,87 @@ export function MapView({ wsManager, selectedNodeId, onSelectNode }: MapViewProp
   // re-filters the already-built collection instead of re-running the full transform over all nodes
   const baseFc = useMemo(() => nodesToFeatureCollection(nodes), [nodes]);
   const geojson = useMemo(() => filterByNodeType(baseFc, typeFilter), [baseFc, typeFilter]);
+  // Live Map lights crossed nodes from the unfiltered list and draws idle nodes as dots
+  const liveNodeIndex = useMemo(() => buildLiveNodeIndex(baseFc), [baseFc]);
+  const dotTypes = useMemo(() => idleDotTypes(typeFilter), [typeFilter]);
+  // Live forces clustering off so every crossed node can light; the saved choice is untouched
+  const effectiveClustered = clustered && !packetFlow;
+  const mapGeojson = useMemo(
+    () => (packetFlow ? withSelectedNode(geojson, baseFc, selectedNodeId) : geojson),
+    [packetFlow, geojson, baseFc, selectedNodeId],
+  );
+
+  // Selected mode colours the one node's edges by observation count + freshness, which only the node
+  // detail endpoint carries (the list's neighborIds are bare uuids). Shares the panel's query cache
+  // (same key), so selecting a node — which opens the panel — usually has this already warm.
+  const { data: focusNeighbors } = useQuery({
+    queryKey: ["node-neighbors", selectedNodeId],
+    queryFn: () => getNodeNeighbors(selectedNodeId!),
+    enabled: shownNeighborLines === "selected" && !!selectedNodeId,
+    staleTime: 30_000,
+  });
+
+  // "on" is a pure client-side render over already-loaded nodes (neighborIds ship with every map
+  // page) so it never refetches; "selected" colours the detail edges; "off" short-circuits to none.
+  const neighborEdges = useMemo(() => {
+    if (shownNeighborLines === "off") return EMPTY_EDGES;
+    if (shownNeighborLines === "selected") {
+      if (!selectedNodeId) return EMPTY_EDGES;
+      return buildFocusedNeighborEdges(nodes.find((n) => n.id === selectedNodeId), focusNeighbors ?? []);
+    }
+    return buildNeighborEdges(nodes, "on", selectedNodeId);
+  }, [nodes, shownNeighborLines, selectedNodeId, focusNeighbors]);
+
+  // With neighbors shown and a node selected, fade every other node (like live mode) to spotlight
+  // the selection and its neighbors. null when there's nothing to focus, so the map stays full-bright.
+  const focusIds = useMemo(
+    () => (shownNeighborLines === "off" ? null : neighborFocusIds(nodes, selectedNodeId)),
+    [nodes, shownNeighborLines, selectedNodeId],
+  );
 
   // IATA coords to frame: the selection's airports, or every airport for "All". Regions carry no
-  // bounds from the API, so their member IATAs stand in for the extent. See CLAUDE.md (map framing).
+  // bounds from the API, so their member IATAs stand in for the extent.
   const fitPoints = useMemo<[number, number][] | null>(() => {
     const withCoords = (iatas ?? []).filter((i) => i.lat != null && i.lon != null);
     if (withCoords.length === 0) return null;
-    const scope = selectedIatas && selectedIatas.length > 0 ? new Set(selectedIatas) : null;
+    const scope = selectedIatas ? new Set(selectedIatas) : null;
     const chosen = scope ? withCoords.filter((i) => scope.has(i.iata)) : withCoords;
     return chosen.length > 0 ? chosen.map((i) => [i.lon!, i.lat!]) : null;
   }, [iatas, selectedIatas]);
 
-  const { containerRef, mapRef, isReady, error } = useMapLibre(styleId, fitPoints, handleStyleError);
+  // Borders to draw: the selected region's IATAs, or every IATA for "All" (most have none configured,
+  // which resolves to a 204 and is dropped). Only fetched while the layer is toggled on.
+  const borderIatas = useMemo(() => {
+    const all = (iatas ?? []).map((i) => i.iata);
+    return selectedIatas ? all.filter((c) => selectedIatas.includes(c)) : all;
+  }, [iatas, selectedIatas]);
+  const borderData = useMapBordersData(borderIatas, borders);
+
+  const { containerRef, mapRef, isReady, error, nodeIconResolverRef } = useMapLibre(styleId, fitPoints, handleStyleError, initialCamera, serializeSelection(selection), terrain);
   const isDark = resolveMapStyle(styleId).dark; // drives marker theming + maplibre control chrome
 
-  useMapNodes(mapRef, isReady, geojson, isDark, themeKey, clustered, onSelectNode, selectedNodeId, `${regionKey}:${typeFilter}`);
+  // Snapshot the current view (live camera + settings) into deep-link params for the copy button.
+  // Evaluated at click, so it reads the real camera; forces tab=Map so the link lands on the map.
+  const buildShareParams = useCallback((): Record<string, string | null> => {
+    const map = mapRef.current;
+    const center = map?.getCenter();
+    const snapshot: MapViewSnapshot = {
+      center: center ? [center.lng, center.lat] : DEFAULT_CENTER,
+      zoom: map?.getZoom() ?? DEFAULT_ZOOM,
+      clustered,
+      nodeType: typeFilter,
+      neighborLines,
+      styleId,
+      flow: packetFlow,
+      borders,
+    };
+    return { tab: "Map", ...buildMapParams(snapshot) };
+  }, [mapRef, clustered, typeFilter, neighborLines, styleId, packetFlow, borders]);
+
+  useMapNodes(mapRef, nodeIconResolverRef, isReady, mapGeojson, isDark, themeKey, effectiveClustered, onSelectNode, selectedNodeId, packetFlow, focusIds, `${regionKey}:${typeFilter}`, dotTypes);
+  useMapNeighbors(mapRef, isReady, neighborEdges, themeKey);
+  useMapBorders(mapRef, isReady, borderData, themeKey);
+  useMapPacketFlow(mapRef, isReady, packetFlow, wsManager, themeKey, regionKey, isDark, liveNodeIndex, onSelectNode);
 
   return (
     <div className="relative flex flex-1 min-h-0">
@@ -108,16 +244,25 @@ export function MapView({ wsManager, selectedNodeId, onSelectNode }: MapViewProp
         styleId={styleId}
         onStyleChange={handleStyleChange}
         typeFilter={typeFilter}
-        onTypeChange={setTypeFilter}
+        onTypeChange={handleTypeChange}
         clustered={clustered}
-        onClusteredChange={setClustered}
+        onClusteredChange={handleClusteredChange}
+        neighborLines={neighborLines}
+        onNeighborLinesChange={handleNeighborLinesChange}
+        borders={borders}
+        onBordersChange={handleBordersChange}
+        terrain={terrain}
+        onTerrainChange={handleTerrainChange}
+        buildShareParams={buildShareParams}
+        liveMap={packetFlow}
       />
+      <PacketFlowButton active={packetFlow} onToggle={() => setPacketFlow((v) => !v)} />
       {/* streams in 50 at a time; the count climbs as pages land, then the pill disappears */}
-      <LoadingPill loading={isPaging} error={nodesError} count={loadedCount} noun="nodes" />
+      <LoadingPill loading={isPaging || regionPending} error={nodesError} count={loadedCount} noun="nodes" />
       {error && (
         // z-20 so the failure overlay covers the settings card (z-10) instead of it floating on top
         <div className="absolute inset-0 z-20 bg-bg-base">
-          <EmptyState title="Map failed to load" subtitle="Check your connection and reload" />
+          <EmptyState title={t("map.loadFailed")} subtitle={t("map.loadFailedHint")} />
         </div>
       )}
     </div>

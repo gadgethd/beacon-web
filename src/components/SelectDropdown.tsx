@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { Dropdown } from "./Dropdown";
 
 interface SelectOption {
@@ -18,7 +19,9 @@ interface SelectDropdownProps {
 
 // single-select dropdown styled to match the packets MultiSelectDropdown trigger
 
-export function SelectDropdown({ label, options, value, onChange, align = "right", allLabel = "All", hideAll = false, fullWidth = false }: SelectDropdownProps) {
+export function SelectDropdown({ label, options, value, onChange, align = "right", allLabel: allLabelProp, hideAll = false, fullWidth = false }: SelectDropdownProps) {
+  const { t } = useTranslation();
+  const allLabel = allLabelProp ?? t("common.all");
   const active = value !== "";
   const selectedLabel = options.find((o) => o.value === value)?.label ?? value;
 
@@ -54,7 +57,7 @@ export function SelectDropdown({ label, options, value, onChange, align = "right
               role="option"
               aria-selected={!active}
               className={`w-full text-left px-2.5 py-1 text-xs font-mono transition-colors ${
-                !active ? "text-text-bright bg-primary/10" : "text-text-muted hover:text-text-normal hover:bg-white/3"
+                !active ? "text-text-bright bg-primary/10" : "text-text-muted hover:text-text-normal hover:bg-text-normal/3"
               }`}
               onClick={() => { onChange(""); close(); }}
             >
@@ -70,7 +73,7 @@ export function SelectDropdown({ label, options, value, onChange, align = "right
                 role="option"
                 aria-selected={isSelected}
                 className={`w-full text-left px-2.5 py-1 text-xs font-mono transition-colors ${
-                  isSelected ? "text-text-bright bg-primary/10" : "text-text-muted hover:text-text-normal hover:bg-white/3"
+                  isSelected ? "text-text-bright bg-primary/10" : "text-text-muted hover:text-text-normal hover:bg-text-normal/3"
                 }`}
                 onClick={() => { onChange(opt.value); close(); }}
               >
@@ -79,7 +82,7 @@ export function SelectDropdown({ label, options, value, onChange, align = "right
             );
           })}
           {hideAll && options.length === 0 && (
-            <div className="px-2.5 py-1 text-xs font-mono text-text-dim">No options</div>
+            <div className="px-2.5 py-1 text-xs font-mono text-text-dim">{t("common.noOptions")}</div>
           )}
         </div>
       )}

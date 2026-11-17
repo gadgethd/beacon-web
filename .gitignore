@@ -15,6 +15,16 @@ build/
 .env.*
 !.env.example
 
+# Key and certificate files
+*.key
+*.pem
+
+# Local data, logs, backups, and database dumps
+.data/
+*.log
+backup-*/
+*.sql
+
 # IDE
 .idea/
 .vscode/
@@ -23,9 +33,6 @@ build/
 # Testing
 coverage/
 .references/
-
-# Claude
-.claude/
 
 # OS
 .DS_Store

@@ -1,20 +1,25 @@
 // Page-load splash: pulsing BEACON wordmark over a themed backdrop, shown once
-// per browser session, then faded out and removed from the DOM.
+// per browser session, then faded out and removed from the DOM. Set VITE_SKIP_SPLASH
+// to skip it entirely for a deployment.
 //
 // To remove the splash entirely: delete this file and remove its import +
 // <SplashScreen /> line from src/App.tsx. Nothing else references it.
 
 import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { BeaconLogo } from "./BeaconLogo";
+import { SKIP_SPLASH } from "../lib/constants";
 
 const SPLASH_KEY = "beacon-splash-shown";
 const VISIBLE_MS = 2000;
 const FADE_MS = 400;
 
 export function SplashScreen() {
+  const { t } = useTranslation();
   // Synchronous gate: decided before first paint so StrictMode's double-mount
   // (and any same-session reload) never re-shows it.
   const [render, setRender] = useState(() => {
+    if (SKIP_SPLASH) return false;
     try {
       if (typeof sessionStorage === "undefined") return false;
       return sessionStorage.getItem(SPLASH_KEY) !== "1";
@@ -61,7 +66,7 @@ export function SplashScreen() {
             className="text-text-muted text-xs tracking-[0.12em]"
             style={{ fontFamily: "'Chakra Petch', sans-serif" }}
           >
-            MeshCore Network Analyzer
+            {t("splash.tagline")}
           </span>
         </span>
       </span>

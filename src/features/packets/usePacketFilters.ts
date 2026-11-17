@@ -1,8 +1,9 @@
 import { useSearchParams } from "react-router-dom";
 import { useMemo, useCallback } from "react";
-import type { PacketFilterState, SearchField } from "./types";
+import type { PacketFilterState, PacketServerFilter, SearchField } from "./types";
 import type { PacketSummary } from "../../types/api";
 import type { PayloadTypeValue, RouteTypeValue } from "../../types/enums";
+import { matchesPathSearch, parsePathSearch, type PathSearch } from "./path-search";
 
 // filter state synced to URL search params
 
@@ -16,9 +17,8 @@ function parseStringArray(value: string | null): string[] {
   return value.split(",").filter(Boolean);
 }
 
-// "path"/"payload" show as disabled placeholders in the filter bar — matchesFilters only
-// implements hash, so don't accept them from the URL either or the search silently does nothing
-const IMPLEMENTED_SEARCH_FIELDS = new Set<SearchField>(["hash"]);
+// Keep unimplemented search modes out of URLs as well as the dropdown.
+const IMPLEMENTED_SEARCH_FIELDS = new Set<SearchField>(["hash", "path"]);
 
 function parseSearchField(value: string | null): SearchField {
   if (value && IMPLEMENTED_SEARCH_FIELDS.has(value as SearchField)) return value as SearchField;
@@ -115,12 +115,31 @@ export function usePacketFilters() {
   return { filters, setFilter, setSearch, setSearchField, clearFilters };
 }
 
+// The /packets endpoint accepts comma-separated payloadTypes/routeTypes/scopes, so any selected
+// dimension goes server-side and pagination pulls the correctly-filtered set from the full history.
+// (observers has no server param, so it stays client-side in matchesFilters, as does the live buffer.)
+// A 4-16 char hex hash search also goes server-side so older packets can be found.
+const HASH_PREFIX_RE = /^[0-9a-f]{4,16}$/i;
+
+export function toServerFilter(filters: PacketFilterState): PacketServerFilter | null {
+  const serverFilter: PacketServerFilter = {};
+  if (filters.payloadTypes.length > 0) serverFilter.payloadTypes = filters.payloadTypes;
+  if (filters.routeTypes.length > 0) serverFilter.routeTypes = filters.routeTypes;
+  if (filters.scopes.length > 0) serverFilter.scopes = filters.scopes;
+  const hashSearch = filters.search.trim();
+  if (filters.searchField === "hash" && HASH_PREFIX_RE.test(hashSearch)) {
+    serverFilter.hashPrefix = hashSearch.toLowerCase();
+  }
+  return Object.keys(serverFilter).length > 0 ? serverFilter : null;
+}
+
 // client-side filter predicate for packet rows
 
 export function matchesFilters(
   packet: PacketSummary,
   filters: PacketFilterState,
   observersByHash?: ReadonlyMap<string, ReadonlySet<string>>,
+  pathSearch?: PathSearch | null,
 ): boolean {
   if (filters.payloadTypes.length > 0 && !filters.payloadTypes.includes(packet.payloadType as PayloadTypeValue)) {
     return false;
@@ -139,10 +158,12 @@ export function matchesFilters(
     return false;
   }
   if (filters.search && filters.searchField === "hash") {
-    const q = filters.search.toLowerCase();
+    const q = filters.search.trim().toLowerCase();
     if (!packet.packetHash.toLowerCase().includes(q)) {
       return false;
     }
   }
+  if (filters.searchField === "path" && !matchesPathSearch(packet,
+    pathSearch === undefined ? parsePathSearch(filters.search) : pathSearch)) return false;
   return true;
 }

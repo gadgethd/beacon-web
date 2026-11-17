@@ -1,18 +1,50 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { MapStyleSwitcher } from "./MapStyleSwitcher";
 import { SegmentedControl } from "./SegmentedControl";
-import { NODE_TYPE_FILTER_OPTIONS } from "./types";
+import { NODE_TYPE_FILTER_OPTIONS, type NeighborLinesMode } from "./types";
+import { liveNeighborLines } from "./live-map";
 import { Section } from "../../components/DetailPanel";
+import { CopyLinkButton } from "../../components/CopyLinkButton";
 import { useIsMobile } from "../../hooks/useMediaQuery";
 
 // Open/closed state persists across sessions; no click-outside dismiss, so it stays open while you pan.
 const OPEN_STORAGE_KEY = "beacon-map-settings-open";
 
-const TYPE_OPTIONS = [{ value: "", label: "All" }, ...NODE_TYPE_FILTER_OPTIONS];
-const CLUSTER_OPTIONS = [
-  { value: "on", label: "On" },
-  { value: "off", label: "Off" },
-];
+// Swatch matching the border layer paint (secondary line over a faint fill), so the legend tracks the theme.
+function BorderLegend() {
+  const { t } = useTranslation();
+  return (
+    <div className="mt-2.5 flex items-center gap-1.5 text-[10px] text-text-dim">
+      <span
+        className="inline-block h-2.5 w-4 rounded-sm border"
+        style={{ borderColor: "var(--palette-secondary)", backgroundColor: "var(--palette-secondary)", opacity: 0.5 }}
+      />
+      {t("map.areaOutline")}
+    </div>
+  );
+}
+
+// Legend for a selected node's coloured edges. Gradient stops mirror the map paint's log anchors
+// (red ~1, yellow ~20 at 60%, green ~150+); palette vars keep it in step with the active theme.
+function NeighborLegend() {
+  const { t } = useTranslation();
+  return (
+    <div className="mt-2.5">
+      <div className="text-[10px] text-text-dim uppercase tracking-wider mb-1">{t("map.observations")}</div>
+      <div
+        className="h-2 rounded-sm border border-border-subtle"
+        style={{ background: "linear-gradient(to right, var(--palette-danger) 0%, var(--palette-warn) 60%, var(--palette-green) 100%)" }}
+      />
+      <div className="relative h-3 mt-0.5 text-[9px] text-text-dim tabular-nums">
+        <span className="absolute left-0">1</span>
+        <span className="absolute -translate-x-1/2" style={{ left: "60%" }}>20</span>
+        <span className="absolute right-0">150+</span>
+      </div>
+      <div className="text-[9px] text-text-dim mt-1">{t("map.fainter")}</div>
+    </div>
+  );
+}
 
 interface MapSettingsPanelProps {
   styleId: string;
@@ -21,6 +53,16 @@ interface MapSettingsPanelProps {
   onTypeChange: (t: string) => void;
   clustered: boolean;
   onClusteredChange: (c: boolean) => void;
+  neighborLines: NeighborLinesMode;
+  onNeighborLinesChange: (mode: NeighborLinesMode) => void;
+  borders: boolean;
+  onBordersChange: (on: boolean) => void;
+  terrain: boolean;
+  onTerrainChange: (on: boolean) => void;
+  // builds deep-link params for the current view, evaluated at copy time (reads the live camera)
+  buildShareParams: () => Record<string, string | null>;
+  // Live Map forces clustering off while it runs; the saved choice comes back afterwards
+  liveMap?: boolean;
 }
 
 export function MapSettingsPanel({
@@ -30,8 +72,24 @@ export function MapSettingsPanel({
   onTypeChange,
   clustered,
   onClusteredChange,
+  neighborLines,
+  onNeighborLinesChange,
+  borders,
+  onBordersChange,
+  terrain,
+  onTerrainChange,
+  buildShareParams,
+  liveMap = false,
 }: MapSettingsPanelProps) {
+  const { t } = useTranslation();
   const isMobile = useIsMobile();
+  const on = { value: "on", label: t("map.on") };
+  const off = { value: "off", label: t("map.off") };
+  const typeOptions = [
+    { value: "", label: t("map.all") },
+    ...NODE_TYPE_FILTER_OPTIONS.map((o) => ({ value: o.value, label: t(`nodeTypes.${o.value}`, { defaultValue: o.label }) })),
+  ];
+  const neighborOptions = [on, { value: "selected", label: t("map.selected") }, off];
   // collapsed by default on mobile (the card would cover the map); a saved preference still wins
   const [open, setOpen] = useState(() => {
     const stored = localStorage.getItem(OPEN_STORAGE_KEY);
@@ -63,34 +121,74 @@ export function MapSettingsPanel({
             <circle cx="9" cy="11.5" r="1.7" fill="currentColor" />
             <path d="M9 11.5h5M12 4.5h2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
           </svg>
-          Map Settings
+          {t("map.settings")}
         </span>
         <span aria-hidden className="text-text-dim text-[9px]">{open ? "▾" : "▸"}</span>
       </button>
 
       {open && (
         <div className="border-t border-border-subtle">
-          <Section title="Map Tiles" first>
+          <Section title={t("map.tiles")} first>
             <MapStyleSwitcher styleId={styleId} onChange={onStyleChange} className="w-full" />
           </Section>
-          <Section title="Node Type">
+          <Section title={t("map.nodeType")}>
             <SegmentedControl
               wrap
-              ariaLabel="Node type"
-              options={TYPE_OPTIONS}
+              ariaLabel={t("map.nodeTypeLabel")}
+              options={typeOptions}
               value={typeFilter}
               onChange={onTypeChange}
             />
           </Section>
-          <Section title="Clustering">
+          <Section title={t("map.clustering")}>
             <SegmentedControl
-              ariaLabel="Clustering"
-              options={CLUSTER_OPTIONS}
-              value={clustered ? "on" : "off"}
+              ariaLabel={t("map.clustering")}
+              options={[on, off]}
+              value={clustered && !liveMap ? "on" : "off"}
               onChange={(v) => onClusteredChange(v === "on")}
+              className="w-full"
+              disabled={liveMap}
+            />
+            {liveMap && <div className="text-[9px] text-text-dim mt-1">{t("map.clusteringLiveNote")}</div>}
+          </Section>
+          <Section title={t("map.neighborLines")}>
+            <SegmentedControl
+              ariaLabel={t("map.neighborLinesLabel")}
+              options={neighborOptions}
+              value={liveNeighborLines(neighborLines, liveMap)}
+              onChange={(v) => onNeighborLinesChange(v as NeighborLinesMode)}
+              className="w-full"
+              disabledValues={liveMap ? ["on"] : undefined}
+            />
+            {liveMap && <div className="text-[9px] text-text-dim mt-1">{t("map.neighborLinesLiveNote")}</div>}
+            {liveNeighborLines(neighborLines, liveMap) === "selected" && <NeighborLegend />}
+          </Section>
+          <Section title={t("map.areaBorders")}>
+            <SegmentedControl
+              ariaLabel={t("map.areaBordersLabel")}
+              options={[on, off]}
+              value={borders ? "on" : "off"}
+              onChange={(v) => onBordersChange(v === "on")}
+              className="w-full"
+            />
+            {borders && <BorderLegend />}
+          </Section>
+          <Section title={t("map.terrain")}>
+            <SegmentedControl
+              ariaLabel={t("map.terrainLabel")}
+              options={[on, off]}
+              value={terrain ? "on" : "off"}
+              onChange={(v) => onTerrainChange(v === "on")}
               className="w-full"
             />
           </Section>
+          <div className="px-3 py-2.5 border-t border-border-subtle flex justify-end">
+            <CopyLinkButton
+              params={buildShareParams}
+              label={t("map.copyLink")}
+              ariaLabel={t("map.copyLinkLabel")}
+            />
+          </div>
         </div>
       )}
     </div>

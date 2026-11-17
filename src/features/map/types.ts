@@ -1,6 +1,8 @@
 // Map feature config: pure data and lookups, no maplibre import, so it stays unit-testable
 // without pulling in the WebGL engine.
 
+import { runtimeEnv } from "../../lib/runtime-env";
+
 export interface MapStyleOption {
   id: string;
   name: string;
@@ -18,6 +20,8 @@ export const DEFAULT_STYLE_ID = "dark";
 
 // beacon-* matches the codebase convention (beacon-theme, beacon-region, beacon-analyzer-open)
 export const MAP_STYLE_STORAGE_KEY = "beacon-map-style";
+export const MAP_CLUSTER_STORAGE_KEY = "beacon-map-clustering";
+export const MAP_NODE_TYPE_STORAGE_KEY = "beacon-map-node-type";
 
 // Always returns an option: falls back to the first entry, which also covers a stale/invalid id
 // restored from localStorage.
@@ -36,9 +40,12 @@ export const DEM_ATTRIBUTION =
 
 export const TERRAIN_EXAGGERATION = 1.5;
 
+// 3D terrain + hillshade, off by default: each view pulls dozens of uncached DEM tiles
+export const MAP_TERRAIN_STORAGE_KEY = "beacon-map-terrain";
+
 // The fallback/initial map view, configured per deployment via .env (VITE_MAP_CENTER as decimal
 // "lat,lon", VITE_MAP_ZOOM). Used before airports load and when a selection has no airport coords;
-// otherwise MapView fits bounds over the airports (see CLAUDE.md, map framing). With neither set,
+// otherwise MapView fits bounds over the airports. With neither set,
 // fall back to a wide world overview.
 const FALLBACK_CENTER: [number, number] = [0, 20]; // [lng, lat] — neutral world view
 const FALLBACK_ZOOM = 1.5;
@@ -70,9 +77,9 @@ export function parseMapZoom(raw: string | undefined): number {
 }
 
 export const DEFAULT_CENTER: [number, number] = parseMapCenter(
-  import.meta.env.VITE_MAP_CENTER as string | undefined,
+  runtimeEnv("VITE_MAP_CENTER", import.meta.env.VITE_MAP_CENTER),
 );
-export const DEFAULT_ZOOM = parseMapZoom(import.meta.env.VITE_MAP_ZOOM as string | undefined);
+export const DEFAULT_ZOOM = parseMapZoom(runtimeEnv("VITE_MAP_ZOOM", import.meta.env.VITE_MAP_ZOOM));
 export const DEFAULT_PITCH = 0; // flat overview, no tilt
 export const DEFAULT_BEARING = 0;
 export const MAX_PITCH = 85;
@@ -89,6 +96,53 @@ export const NODES_SELECTED_LAYER_ID = "nodes-selected"; // circle ring under th
 // Same ring for a node shown as a spiderfied leaf (it's inside a cluster, so the id-filtered
 // NODES_SELECTED_LAYER_ID can't reach it). Fed by its own geojson source, pointed at the leaf.
 export const NODES_SELECTED_LEAF_LAYER_ID = "nodes-selected-leaf";
+
+// --- Neighbor edges layer ---
+export const NEIGHBORS_SOURCE_ID = "neighbors";
+export const NEIGHBORS_LINE_LAYER_ID = "neighbor-lines"; // line layer drawn beneath the node markers
+export const MAP_NEIGHBOR_LINES_STORAGE_KEY = "beacon-map-neighbor-lines";
+export type NeighborLinesMode = "on" | "selected" | "off";
+
+// --- IATA border layer ---
+export const IATA_BORDERS_SOURCE_ID = "iata-borders";
+export const IATA_BORDERS_FILL_LAYER_ID = "iata-borders-fill"; // low-alpha fill beneath the markers
+export const IATA_BORDERS_LINE_LAYER_ID = "iata-borders-line"; // outline stroke over the fill
+export const MAP_BORDERS_STORAGE_KEY = "beacon-map-borders";
+
+// --- Live packet-flow (modelled on MeshMapper's "LiveViz"): dim every node, then per packet shoot an
+// orange dot along its real hop path with a fading dashed trail, flashing each node as the dot crosses ---
+export const PACKET_FLOW_TRAIL_SOURCE_ID = "packet-flow-trail";
+export const PACKET_FLOW_TRAIL_LAYER_ID = "packet-flow-trail"; // dashed line tracing behind the dot
+export const PACKET_FLOW_DOT_SOURCE_ID = "packet-flow-dot";
+export const PACKET_FLOW_DOT_HALO_LAYER_ID = "packet-flow-dot-halo"; // dark halo behind the dot
+export const PACKET_FLOW_DOT_LAYER_ID = "packet-flow-dot"; // the moving packet dot
+export const PACKET_FLOW_COLOR = "#ff6b35"; // warm orange, distinct from the node palette so packets pop
+export const PACKET_FLOW_HOP_MS = 480; // ms the dot takes to cross one hop segment
+export const PACKET_FLOW_FLASH_MS = 900; // a crossed node fades out over this, from the moment the dot reaches it
+export const PACKET_FLOW_TRAIL_FADE_MS = 1000; // the dashed trail fades once the dot reaches the end
+export const PACKET_FLOW_MAX = 120; // cap on concurrent packet animations (busy-feed guard)
+// Opacity of the nodes outside the selection focus. Kept low because overlapping markers composite
+// toward bright.
+export const LIVE_DIM_OPACITY = 0.08;
+// Clusters dim further: many overlapping semi-transparent hexagons composite toward opaque, so a
+// dense cluster field stops being see-through. A lower per-cluster alpha keeps the stack translucent.
+export const LIVE_CLUSTER_DIM_OPACITY = 0.07;
+
+// Live Map idle dots and lit nodes. The sizes and colours are shared with the Flutter app, so both
+// draw the same map; change them in step.
+export const LIVE_DOTS_LAYER_ID = "live-dots"; // idle nodes as small solid dots
+export const LIVE_LIT_SOURCE_ID = "live-lit"; // only the nodes a packet just crossed
+export const LIVE_LIT_LABEL_LAYER_ID = "live-lit-labels"; // their names, beneath every lit icon
+export const LIVE_LIT_ICON_LAYER_ID = "live-lit-icons";
+export const LIVE_DOT_OPACITY = 0.75;
+export const LIVE_DOT_RADIUS_STOPS: ReadonlyArray<readonly [number, number]> = [[7, 2.5], [9, 3], [12, 4.5], [15, 6]]; // [zoom, px]
+export const LIT_RING_RADIUS = 16; // px, the packet-orange ring baked into each lit icon
+export const LIT_RING_WIDTH = 2.5; // px
+export const LIT_GLOW_RADIUS = 18; // px, the type-colour glow fades to nothing here
+export const LIT_GLOW_OPACITY = 0.5;
+export const LIT_LABEL_SIZE = 12; // px
+export const LIT_CLICK_MIN_GLOW = 0.2; // a lit icon fainter than this no longer takes clicks
+export const litIconId = (typeName: string): string => `node-lit-${typeName}`;
 
 export const CLUSTER_RADIUS = 50; // px
 // Keep clustering alive across the whole reachable zoom range (default max is 22). maplibre drops

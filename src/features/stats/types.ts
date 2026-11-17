@@ -1,19 +1,55 @@
-// Response shapes for the /stats/* endpoints and observer telemetry. Verified against beacon-server.
+// Response shapes for the /stats/* endpoints and observer telemetry. Verified against beacon-server,
+// except the activity block, which follows the endpoint handoff until the server ships it.
 
-export interface StatsOverview {
+import type { NodeIATA } from "../nodes/types";
+
+// beacon-server /stats/observer-comparison: disjoint groups of distinct flood
+// packet hashes, selected by reception time in [since, until).
+export interface ObserverComparison {
+  observerA: string;
+  observerB: string;
+  since: number;
+  until: number;
   totalPackets: number;
-  totalObservations: number;
+  onlyA: number;
+  onlyB: number;
+  both: number;
+}
+
+// beacon-server /stats/series: hourly rollups. Only complete hours carry values; the summary covers
+// those, and observers/IATAs/scopes are distinct across the window so they don't sum from the hours.
+export interface SeriesValues {
+  observations: number;
+  uniquePackets: number;
   activeObservers: number;
   activeIatas: number;
-  windowHours: number;
+  scopedPackets: number;
+  activeScopes: number;
+  maxPathEntries: number;
+  snrSum: number;
+  snrSamples: number;
+  rssiSum: number;
+  rssiSamples: number;
+}
+export interface SeriesHour {
+  hour: number; // epoch ms, UTC hour start
+  status: "complete" | "partial" | "missing";
+  values: SeriesValues | null;
+}
+export interface StatsSeries {
+  since: number;
+  until: number;
+  revision: number;
+  earliestComplete: number | null;
+  completeHours: number;
+  hours: SeriesHour[];
+  summary: SeriesValues;
 }
 
 export interface ObservationPoint {
   hour: number; // epoch ms, start of the hourly bucket
   iata: string;
   observationCount: number;
-  uniquePackets: number;
-  activeObservers: number;
 }
 
 export interface PayloadBreakdownItem {
@@ -23,7 +59,8 @@ export interface PayloadBreakdownItem {
 }
 
 export interface TopNode {
-  nodeId: string;
+  nodeId: string | null; // null once the node row is deleted; key rows by publicKey
+  publicKey: string;
   nodeName: string | null;
   nodeType: number;
   nodeTypeName: string;
@@ -38,6 +75,42 @@ export interface TopObserver {
   observerType: string | null;
   iata: string;
   observationCount: number;
+}
+
+export type AdvertiserSort = "flood" | "direct";
+
+export interface TopAdvertiser {
+  nodeId: string | null; // null once the node row is deleted; key rows by publicKey
+  publicKey: string;
+  nodeName: string | null;
+  nodeType: number;
+  nodeTypeName: string;
+  iata: string;
+  advertCount: number;
+  // advertCount split by route: flood = route type 0/1 (broadcast, no path), direct = 2/3 (routed).
+  // floodAdvertCount + directAdvertCount === advertCount.
+  floodAdvertCount: number;
+  directAdvertCount: number;
+  lastHeard: number; // epoch ms
+}
+
+// grouped by decrypted sender display-name, not node identity: same-named pubkeys merge, a rename splits
+export interface TopTalker {
+  senderName: string;
+  messageCount: number;
+  lastSent: number; // epoch ms
+}
+
+// A repeater/room server whose latest advert-derived clock drift exceeds the server threshold.
+// Only out-of-sync nodes appear; the list is ordered worst-drift-first (by magnitude).
+export interface ClockDriftEntry {
+  nodeId: string;
+  nodeName: string | null;
+  nodeType: number;
+  nodeTypeName: string;
+  clockDriftSeconds: number; // signed; +ve = device ahead of server
+  clockCheckedAt: number; // epoch ms
+  iatas?: NodeIATA[];
 }
 
 export interface RadioPreset {
@@ -58,13 +131,15 @@ export interface ScopeStats {
   packetCount: number;
   observerCount: number;
   nodeCount: number;
+  // hours where all three are zero are omitted; older servers omit hourly, or observers/nodes within it
+  hourly?: { hour: number; packets: number; observers?: number; nodes?: number }[];
 }
 
 export interface TelemetryPoint {
   t: number; // epoch ms
   batteryMv: number | null;
-  airtimeTxPct: number | null;
-  airtimeRxPct: number | null;
+  airtimeTxSecs: number | null; // cumulative since boot on 1h points, per-bucket delta otherwise
+  airtimeRxSecs: number | null;
   noiseFloorDb: number | null;
   uptimeSeconds: number | null;
   queueLength: number | null;
@@ -77,8 +152,50 @@ export interface ObserverTelemetry {
   points: TelemetryPoint[];
 }
 
+// GET /observers/{id}/activity: what the observer heard per `interval`. The tab hides these charts on a 404.
+export interface ActivityPoint {
+  t: number; // epoch ms, bucket start
+  observations: number | null; // null only for a filled gap the server never read
+  airtimeMs: number | null; // summed LoRa time-on-air; null when no row in the bucket could be costed
+  snrAvg: number | null;
+  snrMin: number | null;
+  rssiAvg: number | null;
+}
+
+export interface ActivityRadio {
+  freqMhz: number | null;
+  sf: number | null;
+  bwKhz: number | null;
+  cr: number | null;
+  preambleSymbols: number | null;
+}
+
+export interface ObserverActivitySummary {
+  recordedPackets: number;
+  lastCompleteHour: number;
+  lastCompleteHourStart: number;
+  lastCompleteHourEnd: number;
+  latestRecordedAt: number | null;
+}
+export interface ObserverActivity {
+  windowStart?: number;
+  windowEnd?: number;
+  generatedAt?: number;
+  source?: "raw" | "hourly";
+  // hourly only: rollups cover buckets before rolledUntil (absent before the first rollup), raw rows
+  // from rawFrom; hours between are unread
+  rolledUntil?: number;
+  rawFrom?: number;
+  summary?: ObserverActivitySummary;
+  range: string;
+  interval: string;
+  radio: ActivityRadio | null;
+  payloadTypes: PayloadBreakdownItem[];
+  points: ActivityPoint[];
+}
+
 // Sub-tab + time-range identifiers shared across the Stats page.
-export type StatsTab = "mesh" | "observer";
+export type StatsTab = "mesh" | "traffic" | "signal" | "paths" | "scopes" | "talkers" | "clockdrift" | "compare" | "graph";
 export type StatsRange = "24h" | "7d" | "30d";
 
 export const RANGE_MS: Record<StatsRange, number> = {
@@ -86,3 +203,50 @@ export const RANGE_MS: Record<StatsRange, number> = {
   "7d": 7 * 24 * 60 * 60 * 1000,
   "30d": 30 * 24 * 60 * 60 * 1000,
 };
+
+// beacon-server /stats/signal: retained observation rows in [since, until).
+export interface SignalBin { lower: number | null; upper: number | null; count: number }
+export interface SignalMetric { samples: number; average: number | null; histogram: SignalBin[] }
+export interface SignalHour {
+  hour: number;
+  receptions: number;
+  snrSamples: number;
+  snrAverage: number | null;
+  rssiSamples: number;
+  rssiAverage: number | null;
+}
+export interface SignalStats {
+  since: number;
+  until: number;
+  receptions: number;
+  snr: SignalMetric;
+  rssi: SignalMetric;
+  hourly: SignalHour[];
+}
+
+// beacon-server /stats/paths: retained receptions; the four categories partition the total.
+export interface PathHashWidth { bytes: number; receptions: number }
+export interface PathLengthBin { entries: number; receptions: number }
+export interface PathHour {
+  hour: number;
+  receptions: number;
+  oneByte: number;
+  twoByte: number;
+  threeByte: number;
+  empty: number;
+  trace: number;
+  unclassified: number;
+  maxEntries?: number; // longest path that hour; servers before beacon-server's maxEntries omit it
+}
+export interface PathStats {
+  since: number;
+  until: number;
+  receptions: number;
+  hashed: number;
+  empty: number;
+  trace: number;
+  unclassified: number;
+  hashWidths: PathHashWidth[];
+  pathLengths: PathLengthBin[];
+  hourly: PathHour[];
+}

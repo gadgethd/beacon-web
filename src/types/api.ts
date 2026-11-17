@@ -2,16 +2,28 @@ import type { PathConfidence } from "./enums";
 
 // response wrappers
 
-export interface CursorPage<T> {
+export interface CursorPage<T, C = number> {
   items: T[];
-  nextCursor: number | null;
+  nextCursor: C | null;
   hasMore: boolean;
+  // opaque exact cursor; /packets (global), /nodes, /observers, /channels. Never parsed or built here.
+  nextPageCursor?: string;
 }
+
+export interface PageParam<C = number> { cursor?: C; pageCursor?: string }
 
 export interface LatestObserver {
   id: string;
   displayName?: string;
   iata: string;
+  // path fields land on the REST list from beacon-server ae0669c, and on live rows via the WS feed;
+  // resolvedSource/Destination are WS-only for now — the list endpoints leave them nil on purpose.
+  pathLength?: PathLength;
+  pathBytes?: string;
+  resolvedSource?: ResolvedHop;
+  resolvedDestination?: ResolvedHop;
+  // per-hop resolved path, for the REST list once the backend fills it in — nothing populates it today.
+  resolvedPath?: ResolvedHop[];
 }
 
 // packet list and detail shapes
@@ -27,6 +39,7 @@ export interface PacketSummary {
   observationCount: number;
   latestObserver?: LatestObserver;
   scope?: string; // matched transport scope name, e.g. "#bc"
+  summary?: string; // packet-derived display text (advert name, TRACE tag, ACK checksum, …)
 }
 
 export interface ResolvedNode {
@@ -69,6 +82,10 @@ export interface Observation {
   };
   sourceBroker: string;
   resolvedPath: ResolvedHop[];
+  // the packet's logical endpoints, resolved from the payload; separate from the relay
+  // resolvedPath. Absent for payload types with no addressed endpoint (GRP_TXT/GRP_DATA/TRACE).
+  resolvedSource?: ResolvedHop;
+  resolvedDestination?: ResolvedHop;
 }
 
 export interface PacketHeader {
@@ -144,12 +161,39 @@ export interface RouteHop {
 
 export interface KnownRoute {
   id: number;
+  pathKey?: string; // stable full-route identity; absent on older servers
   iata: string;
   hopCount: number;
   hops: RouteHop[];
   firstSeen: number; // epoch ms
   lastSeen: number; // epoch ms
   observationCount: number;
+}
+
+export interface RouteObservation {
+  id: number;
+  packetHash: string;
+  observerId: string;
+  observerName?: string;
+  heardAt: number;
+  payloadType: number;
+  payloadTypeName: string;
+  rssi?: number;
+  snr?: number;
+}
+
+export interface RouteEvidence {
+  route: KnownRoute;
+  windowStart: number;
+  windowEnd: number;
+  generatedAt: number;
+  matchType: "saved_path_prefixes";
+  matchAvailable: boolean;
+  hashSize?: number;
+  pathBytes?: string;
+  items: RouteObservation[];
+  hasMore: boolean;
+  nextPageCursor?: string;
 }
 
 // the boundary hop in a cross-IATA route: the link from the last node in the source IATA to the
@@ -173,12 +217,18 @@ export interface CrossIATARoute {
 
 // trace tags — a trace series groups the packets that share a 4-byte trace tag. The list endpoint
 // returns per-tag summaries; the detail endpoint returns the tag's packets with their resolved routes.
+// Each tag is either a route TRACE or a PING (round-trip) — the backend tags which.
+export type TraceType = "TRACE" | "PING";
+
 export interface TraceTagSummary {
   traceTag: string; // hex-encoded 4-byte tag
   firstHeardAt: number; // epoch ms
   lastHeardAt: number; // epoch ms
   packetCount: number;
   iataCount: number; // distinct IATAs the tag was heard in
+  traceType: TraceType;
+  pathHashes: string[]; // hops from the most complete observation we've seen for this tag
+  snrValues: number[]; // per-hop SNR (dB), index-aligned with pathHashes
 }
 
 export interface RawHop {
@@ -193,8 +243,9 @@ export interface TracePacket {
   scope?: string; // matched transport scope name, when any
   firstHeardAt: number; // epoch ms
   lastHeardAt: number; // epoch ms
-  rawPath: RawHop[]; // one hop per trace path hash, index-aligned with resolvedRoute
-  resolvedRoute: ResolvedHop[]; // one hop per trace path hash; nodes empty when unresolved
+  // both null when the payload didn't parse; resolvedRoute also when the packet has no IATAs
+  rawPath: RawHop[] | null; // one hop per trace path hash, index-aligned with resolvedRoute
+  resolvedRoute: ResolvedHop[] | null; // one hop per trace path hash; nodes empty when unresolved
 }
 
 export interface TraceDetail {

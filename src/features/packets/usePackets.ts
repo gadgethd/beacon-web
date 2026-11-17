@@ -1,10 +1,13 @@
 import { useState, useEffect, useCallback, useMemo, useSyncExternalStore } from "react";
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { getPackets } from "../../api/client";
+import { isRateLimited } from "../../api/rate-limit";
+import { fetchPage, nextPageParam } from "../../api/paging";
 import { useRegion } from "../../hooks/useRegion";
 import type { WsPacketObservation, WsLagged } from "../../types/ws";
-import type { PacketSummary } from "../../types/api";
-import { LIVE_BUFFER_CAP, MAX_INFINITE_PAGES } from "../../lib/constants";
+import type { CursorPage, PacketSummary, PageParam } from "../../types/api";
+import type { PacketServerFilter } from "./types";
+import { LIVE_BUFFER_CAP } from "../../lib/constants";
 
 // merge and deduplicate live + paginated packets
 
@@ -38,6 +41,8 @@ class LivePacketStore {
   private snapshot: LiveSnapshot = { buffer: [], acknowledgedCount: 0, observersByHash: new Map() };
   private listeners = new Set<() => void>();
   private rafId: number | null = null;
+  // bumped by reset(), so work started for one region can tell it has been overtaken
+  generation = 0;
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -69,8 +74,15 @@ class LivePacketStore {
 
     const existing = this.hashIndex.get(summary.packetHash);
     if (existing !== undefined) {
+      // A WS message only knows its own heardAt, so widen the window rather than replacing it —
+      // otherwise the expanded row's spread reads 0 for every re-heard packet.
+      const prev = this.buffer[existing]!;
       this.buffer = [...this.buffer];
-      this.buffer[existing] = summary;
+      this.buffer[existing] = {
+        ...summary,
+        firstHeardAt: Math.min(prev.firstHeardAt, summary.firstHeardAt),
+        lastHeardAt: Math.max(prev.lastHeardAt, summary.lastHeardAt),
+      };
     } else {
       this.buffer = [summary, ...this.buffer];
       this.rebuildIndex();
@@ -84,6 +96,10 @@ class LivePacketStore {
       }
     }
     this.scheduleNotify();
+  }
+
+  has(packetHash: string): boolean {
+    return this.hashIndex.has(packetHash);
   }
 
   private rebuildIndex(): void {
@@ -104,6 +120,7 @@ class LivePacketStore {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
+    this.generation++;
     this.buffer = [];
     this.hashIndex.clear();
     this.observersByHash.clear();
@@ -114,14 +131,16 @@ class LivePacketStore {
 
 // combines live WS stream with paginated history
 
-export function usePackets() {
-  const { iatas, regionKey } = useRegion();
+export function usePackets(frozen: boolean = false, serverFilter: PacketServerFilter | null = null) {
+  const { iatas, regionKey, isResolved } = useRegion();
+  const pending = isResolved === false;
   const queryClient = useQueryClient();
   const [store] = useState(() => new LivePacketStore());
   const [laggedCount, setLaggedCount] = useState(0);
 
   const [prevRegionKey, setPrevRegionKey] = useState(regionKey);
-  if (prevRegionKey !== regionKey) {
+  const regionChanged = prevRegionKey !== regionKey;
+  if (regionChanged) {
     setPrevRegionKey(regionKey);
     store.reset();
     setLaggedCount(0);
@@ -132,8 +151,19 @@ export function usePackets() {
     store.getSnapshot,
   );
 
+  // While scrolled away from the top, render a latched buffer so live prepends don't shift the
+  // view; the held packets reveal when the user returns to the top. Latched by holding the last
+  // value (set-state-during-render, this file's pattern — cf. prevRegionKey above). The
+  // regionChanged guard drops the latch so a region switch never shows the previous region.
+  const [displayBuffer, setDisplayBuffer] = useState(liveBuffer);
+  if ((!frozen || regionChanged) && displayBuffer !== liveBuffer) {
+    setDisplayBuffer(liveBuffer);
+  }
+
   const handlePacketObservation = useCallback(
     (data: WsPacketObservation["data"]) => {
+      // the previous region's subscription can still deliver after the buffer reset
+      if (iatas && !iatas.includes(data.observation.iata)) return;
       const summary: PacketSummary = {
         packetHash: data.packetHash,
         payloadType: data.packet.payloadType,
@@ -144,30 +174,63 @@ export function usePackets() {
         lastHeardAt: data.observation.heardAt,
         observationCount: data.packet.observationCount,
         scope: data.packet.scope,
+        summary: data.packet.summary,
         latestObserver: {
           id: data.observation.observerId,
           displayName: data.observation.observerName,
           iata: data.observation.iata,
+          pathLength: data.observation.pathLength,
+          pathBytes: data.observation.pathBytes,
+          // WS nulls these when the payload type carries no endpoint; the REST shape uses undefined
+          resolvedSource: data.observation.resolvedSource ?? undefined,
+          resolvedDestination: data.observation.resolvedDestination ?? undefined,
         },
       };
 
       store.pushOrUpdate(summary);
     },
-    [store],
+    [store, iatas],
   );
 
-  // Reset (drop to one fresh first page) instead of invalidate: an invalidate replays every cached
-  // page sequentially — up to 20 requests per lag notice during a flood.
+  // One request per notice, never an invalidate: that replays every cached page, up to 20 requests
+  // during a flood. When the newest page overlaps the list, the missed packets go in through the
+  // live buffer, so loaded pages and the scroll position stay; otherwise it alone becomes the list.
   const handleLagged = useCallback(
-    (data: WsLagged) => {
+    async (data: WsLagged): Promise<void> => {
       setLaggedCount((prev) => prev + data.droppedCount);
-      queryClient.resetQueries({ queryKey: ["packets", regionKey] });
+      // while the API is throttling us the refetch would only 429; the next lag notice or remount heals it
+      if (isRateLimited()) return;
+      const key = serverFilter ? ["packets", regionKey, serverFilter] : ["packets", regionKey];
+      const cached = queryClient.getQueryData<InfiniteData<CursorPage<PacketSummary>>>(key);
+      if (!cached?.pages.length) {
+        await queryClient.resetQueries({ queryKey: ["packets", regionKey] });
+        return;
+      }
+      const generation = store.generation;
+      let newest: CursorPage<PacketSummary>;
+      try {
+        newest = await getPackets(iatas, { ...serverFilter });
+      } catch {
+        return; // keep what is shown; the next notice or remount heals the gap
+      }
+      if (store.generation !== generation) return;
+      const shown = new Set(flattenPages(cached).map((p) => p.packetHash));
+      const known = (p: PacketSummary) => shown.has(p.packetHash) || store.has(p.packetHash);
+      if (newest.items.some(known)) {
+        for (const p of [...newest.items].reverse()) if (!known(p)) store.pushOrUpdate(p);
+      } else {
+        queryClient.setQueryData<InfiniteData<CursorPage<PacketSummary>>>(key, { pages: [newest], pageParams: [undefined] });
+      }
+      // other filter variants of this region can't be patched, so they start over when next shown
+      const active = JSON.stringify(key);
+      await queryClient.resetQueries({ queryKey: ["packets", regionKey], predicate: (q) => JSON.stringify(q.queryKey) !== active });
     },
-    [queryClient, regionKey],
+    [queryClient, regionKey, serverFilter, iatas, store],
   );
 
   // The WS handler is down whenever this tab is unmounted, so cached history may hide a gap right
-  // where the live buffer begins. Refresh the first page on mount to close it.
+  // where the live buffer begins. Refresh the first page on mount to close it (prefix match:
+  // filtered variants included).
   useEffect(() => {
     queryClient.resetQueries({ queryKey: ["packets", regionKey] });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount only; region changes refetch via the key
@@ -179,20 +242,27 @@ export function usePackets() {
     data: history,
     fetchNextPage,
     hasNextPage,
+    isFetching,
     isFetchingNextPage,
+    isLoading,
+    isError,
+    refetch,
   } = useInfiniteQuery({
-    queryKey: ["packets", regionKey],
+    // The unfiltered key must stay 2-element so its cached entry survives filter toggling; the
+    // lagged/mount resets above match both shapes by prefix.
+    queryKey: serverFilter ? ["packets", regionKey, serverFilter] : ["packets", regionKey],
     // first load and every scroll page are the default 50; getPackets fills in the limit
-    queryFn: ({ pageParam }) => getPackets(iatas, { cursor: pageParam }),
-    getNextPageParam: (last) => last.nextCursor ?? undefined,
-    initialPageParam: undefined as number | undefined,
+    queryFn: ({ pageParam }) =>
+      fetchPage(pageParam, (page) => getPackets(iatas, { cursor: page?.cursor, pageCursor: page?.pageCursor, ...serverFilter })),
+    getNextPageParam: nextPageParam,
+    initialPageParam: undefined as PageParam<number> | undefined,
     staleTime: Infinity,
-    maxPages: MAX_INFINITE_PAGES,
+    enabled: !pending,
   });
 
   const allPackets = useMemo(
-    () => dedup([...liveBuffer, ...flattenPages(history)]),
-    [liveBuffer, history],
+    () => dedup([...displayBuffer, ...flattenPages(history)]),
+    [displayBuffer, history],
   );
 
   const observerOptions = useMemo(() => {
@@ -220,7 +290,11 @@ export function usePackets() {
     acknowledgeNewPackets,
     fetchNextPage,
     hasNextPage: hasNextPage ?? false,
+    isFetching,
     isFetchingNextPage,
+    isLoading: isLoading || pending,
+    isError,
+    refetch,
     observersByHash,
     handlePacketObservation,
     handleLagged,
