@@ -532,6 +532,8 @@
       "inspect": "Granska paket från {{sender}}",
       "loading": "Läser in meddelanden…",
       "loadingOlder": "Läser in äldre meddelanden… ({{count}} visas)",
+      "jumpToNew": "{{count}} nya meddelanden. Gå till det senaste",
+      "latest": "Senaste meddelanden",
       "loadOlder": "Läs in äldre meddelanden",
       "empty": "Inga meddelanden för den här kanalen.",
       "emptyScope": "Inga meddelanden matchar {{scope}}.",

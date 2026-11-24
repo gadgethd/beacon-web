@@ -81,12 +81,12 @@ function storeRegions(regions: Region[]) {
 }
 
 // A server that lists each region's IATAs answers in one call; an older one needs each region's detail.
-async function fetchRegions(): Promise<Region[]> {
-  const summaries = await getRegions();
+async function fetchRegions(signal: AbortSignal): Promise<Region[]> {
+  const summaries = await getRegions(signal);
   if (summaries.every(listsIatas)) return summaries;
   // a listed region whose detail 404s is dropped like an unknown slug; 4xx is never retried,
   // so failing the whole query would leave the selection unresolved for good
-  const regions = await Promise.all(summaries.map((s) => getRegion(s.id).catch((err: unknown) => {
+  const regions = await Promise.all(summaries.map((s) => getRegion(s.id, signal).catch((err: unknown) => {
     if ((err as { status?: unknown } | null)?.status !== 404) throw err;
     return null;
   })));
@@ -98,8 +98,8 @@ async function fetchRegions(): Promise<Region[]> {
 export function useRegions(): RegionsData {
   const { data } = useQuery({
     queryKey: ["regions"],
-    queryFn: async () => {
-      const regions = await fetchRegions();
+    queryFn: async ({ signal }) => {
+      const regions = await fetchRegions(signal);
       storeRegions(regions);
       return regions;
     },

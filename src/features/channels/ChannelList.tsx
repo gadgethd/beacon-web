@@ -18,22 +18,31 @@ import type { WsManager } from "../../api/ws-manager";
 
 interface ChannelListProps {
   wsManager: WsManager;
-  onAnalyze: (hash: string | null) => void;
+  onAnalyze?: (hash: string | null) => void;
+  publicFeed?: boolean;
 }
 
 // keyed channels are few, so they load in big pages; the rest page on demand
 const KEYED_PAGE_SIZE = 200;
 const nextChannelPage = (last: ChannelPage) => last.hasMore ? last.nextPageCursor ?? last.nextCursor ?? undefined : undefined;
 
-function appendMessages(old: InfiniteData<CursorPage<ChannelMessage>> | undefined, messages: ChannelMessage[]) {
+function appendMessages(old: InfiniteData<CursorPage<ChannelMessage>> | undefined, messages: ChannelMessage[], bounded: boolean) {
   if (!old) return old;
   const known = new Set(old.pages.flatMap((page) => page.items.map((message) => message.packetHash)));
   const added = messages.filter((message) => !known.has(message.packetHash));
   if (!added.length) return old;
-  return { ...old, pages: old.pages.map((page, index) => index === 0 ? { ...page, items: [...page.items, ...added] } : page) };
+  return { ...old, pages: old.pages.map((page, index) => {
+    if (index !== 0) return page;
+    const items = [...page.items, ...added];
+    if (bounded && items.length > LIVE_BUFFER_CAP) {
+      items.sort((a, b) => b.sentAt - a.sentAt);
+      items.length = LIVE_BUFFER_CAP;
+    }
+    return { ...page, items };
+  }) };
 }
 
-export function ChannelList({ wsManager, onAnalyze }: ChannelListProps) {
+export function ChannelList({ wsManager, onAnalyze, publicFeed = false }: ChannelListProps) {
   const { t } = useTranslation();
   const { iatas, regionKey, isResolved } = useRegion();
   const regionPending = isResolved === false;
@@ -68,9 +77,9 @@ export function ChannelList({ wsManager, onAnalyze }: ChannelListProps) {
       // Merge live arrivals after history settles so its older snapshot cannot erase them.
       const queued = [...pendingMessages.current.values()];
       pendingMessages.current.clear();
-      queryClient.setQueryData<InfiniteData<CursorPage<ChannelMessage>>>(messageKey, (old) => appendMessages(old, queued));
+      queryClient.setQueryData<InfiniteData<CursorPage<ChannelMessage>>>(messageKey, (old) => appendMessages(old, queued, publicFeed));
     }
-  }, [messageKey, queryClient]);
+  }, [messageKey, queryClient, publicFeed]);
 
   useEffect(() => {
     flushPending();
@@ -98,28 +107,29 @@ export function ChannelList({ wsManager, onAnalyze }: ChannelListProps) {
   const keyedKey = useMemo(() => ["channels", regionKey, "keyed"], [regionKey]);
   const keyed = useInfiniteQuery({
     queryKey: keyedKey,
-    queryFn: ({ pageParam }) => getChannels({ iatas, cursor: pageParam, keyKnown: true, limit: KEYED_PAGE_SIZE }),
+    queryFn: ({ pageParam, signal }) => getChannels({ iatas, cursor: pageParam, keyKnown: true, limit: KEYED_PAGE_SIZE }, signal),
     initialPageParam: undefined as number | string | undefined,
     getNextPageParam: nextChannelPage,
     staleTime: 60_000,
+    maxPages: publicFeed ? 5 : undefined,
     enabled: !regionPending,
   });
   const keyedLoading = keyed.isLoading || regionPending;
   const others = useInfiniteQuery({
     queryKey: ["channels", regionKey, "other"],
-    queryFn: ({ pageParam }) => getChannels({ iatas, cursor: pageParam, keyKnown: false }),
+    queryFn: ({ pageParam, signal }) => getChannels({ iatas, cursor: pageParam, keyKnown: false }, signal),
     initialPageParam: undefined as number | string | undefined,
     getNextPageParam: nextChannelPage,
     staleTime: 60_000,
-    enabled: !regionPending && (showOthers || keyFilter === "unknown"),
+    enabled: !publicFeed && !regionPending && (showOthers || keyFilter === "unknown"),
   });
 
   // A server without the keyKnown filter mixes unkeyed channels in; don't page through all of them.
   const keyedUnfiltered = keyed.data?.pages.some((p) => p.items.some((ch) => !ch.keyKnown)) ?? false;
   const { hasNextPage: keyedHasMore, isFetching: keyedFetching, isError: keyedError, fetchNextPage: fetchKeyed } = keyed;
   useEffect(() => {
-    if (keyedHasMore && !keyedFetching && !keyedError && !keyedUnfiltered) void fetchKeyed();
-  }, [keyedHasMore, keyedFetching, keyedError, keyedUnfiltered, fetchKeyed]);
+    if (!publicFeed && keyedHasMore && !keyedFetching && !keyedError && !keyedUnfiltered) void fetchKeyed();
+  }, [publicFeed, keyedHasMore, keyedFetching, keyedError, keyedUnfiltered, fetchKeyed]);
 
   useEffect(() => {
     if (!keyedFetching && refreshPending.current) {
@@ -208,18 +218,22 @@ export function ChannelList({ wsManager, onAnalyze }: ChannelListProps) {
         // A fresh arrival is the only signal left once idle-and-overflowed, so try recovery here too.
         flushPending();
         // The WS event has no retained observation total; repeats do not add observers.
-        setHeardCounts((prev) => ({
-          ...prev,
-          [data.packetHash]: Math.max(prev[data.packetHash] ?? 0, data.observationCount ?? 1),
-        }));
+        setHeardCounts((prev) => {
+          const previous = prev[data.packetHash];
+          const reach = Math.max(previous ?? 0, data.observationCount ?? 1);
+          if (previous === reach) return prev;
+          const retained = publicFeed && previous === undefined
+            ? Object.fromEntries(Object.entries(prev).slice(-(LIVE_BUFFER_CAP - 1))) : prev;
+          return { ...retained, [data.packetHash]: reach };
+        });
         // Append to the retained newest page; browsing older history must not evict it.
         queryClient.setQueryData<InfiniteData<CursorPage<ChannelMessage>>>(
           messageKey,
-          (old) => appendMessages(old, [data]),
+          (old) => appendMessages(old, [data], publicFeed),
         );
       }
     },
-    [queryClient, selectedId, selection, regionKey, keyedKey, messageScope, messageKey, flushPending],
+    [queryClient, selectedId, selection, regionKey, keyedKey, messageScope, messageKey, flushPending, publicFeed],
   );
 
   useWsChannelMessageHandler(wsManager, handleChannelMessage);
@@ -229,7 +243,12 @@ export function ChannelList({ wsManager, onAnalyze }: ChannelListProps) {
 
   return (
     <div className="flex flex-col flex-1 min-h-0">
-      {showList && (
+      {showList && (publicFeed ? (
+        <label className="ukmesh-channel-search">
+          Find a channel
+          <input value={search} onChange={(event) => setSearch(event.target.value)} type="search" />
+        </label>
+      ) : (
         <ChannelFilterBar
           search={search}
           onSearchChange={setSearch}
@@ -240,7 +259,7 @@ export function ChannelList({ wsManager, onAnalyze }: ChannelListProps) {
           hashtagFilter={hashtagFilter}
           onHashtagChange={setHashtagFilter}
         />
-      )}
+      ))}
       <div className="flex flex-1 min-h-0">
         {showList && (
           <div className="flex flex-col min-h-0 w-full md:w-56 md:min-w-56 border-r border-border bg-bg-surface">
@@ -261,8 +280,10 @@ export function ChannelList({ wsManager, onAnalyze }: ChannelListProps) {
               <PagerButton disabled={keyed.isFetching} onClick={() => void keyed.refetch()}>
                 {keyed.isFetching ? t("channels.loadingChannels") : t("channels.retryChannels")}
               </PagerButton>
+            ) : publicFeed ? (
+              keyedHasMore && <PagerButton disabled={keyedFetching} onClick={() => void fetchKeyed()}>{t("channels.loadMore")}</PagerButton>
             ) : !others.isEnabled ? (
-              !keyedLoading && <PagerButton onClick={() => setOthersRegion(regionKey)}>{t("channels.loadOthers")}</PagerButton>
+              !publicFeed && !keyedLoading && <PagerButton onClick={() => setOthersRegion(regionKey)}>{t("channels.loadOthers")}</PagerButton>
             ) : (others.hasNextPage || others.isError) && (
               <PagerButton disabled={others.isFetching} onClick={() => void (others.hasNextPage ? others.fetchNextPage() : others.refetch())}>
                 {others.isFetching ? t("channels.loadingChannels") : others.isError ? t("channels.retryChannels") : t("channels.loadMore")}
@@ -277,7 +298,8 @@ export function ChannelList({ wsManager, onAnalyze }: ChannelListProps) {
             iatas={iatas}
             regionKey={regionKey}
             scope={messageScope}
-            onScopeChange={handleScopeChange}
+            onScopeChange={publicFeed ? undefined : handleScopeChange}
+            publicFeed={publicFeed}
             onAnalyze={onAnalyze}
             onBack={isMobile ? () => setSelection(null) : undefined}
           />

@@ -547,6 +547,8 @@
       "inspect": "Inspecter le paquet de {{sender}}",
       "loading": "Chargement des messages…",
       "loadingOlder": "Chargement des messages plus anciens… ({{count}} affichés)",
+      "jumpToNew": "{{count}} nouveaux messages. Aller au dernier",
+      "latest": "Derniers messages",
       "loadOlder": "Charger les messages plus anciens",
       "empty": "Aucun message pour ce canal.",
       "emptyScope": "Aucun message ne correspond à {{scope}}.",

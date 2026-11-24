@@ -1,5 +1,6 @@
 /// <reference types="vitest/config" />
 import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
@@ -13,6 +14,7 @@ const languageNames = Object.fromEntries(readdirSync(locales).filter((file) => f
 ]));
 
 export default defineConfig(({ mode }) => {
+  const ukmeshFeed = mode === "ukmesh-feed";
   // A shared DEV launcher can supply an empty directory instead of a deployment .env.
   const envDir = process.env.BEACON_DEV_ENV_DIR ?? process.cwd();
   const env = loadEnv(mode, envDir, "VITE_");
@@ -21,6 +23,10 @@ export default defineConfig(({ mode }) => {
 
   return {
     envDir,
+    ...(ukmeshFeed ? {
+      base: "/beacon-feed/",
+      build: { rollupOptions: { input: fileURLToPath(new URL("./ukmesh-feed.html", import.meta.url)) } },
+    } : {}),
     plugins: [react(), tailwindcss()],
     define: { __APP_VERSION__: JSON.stringify(pkg.version), __LANGUAGE_NAMES__: JSON.stringify(languageNames) },
     server: proxyTarget

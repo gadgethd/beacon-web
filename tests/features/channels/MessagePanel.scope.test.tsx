@@ -88,7 +88,7 @@ describe("channel scope evidence", () => {
     fireEvent.click(screen.getByRole("button", { name: /Scope.*All scopes/ }));
     fireEvent.click(screen.getByRole("option", { name: "#yow", exact: true }));
     await waitFor(() =>
-      expect(getChannelMessagesPage).toHaveBeenLastCalledWith(1, expect.objectContaining({ scope: "#yow" })),
+      expect(getChannelMessagesPage).toHaveBeenLastCalledWith(1, expect.objectContaining({ scope: "#yow" }), expect.any(AbortSignal)),
     );
     await waitFor(() => expect(screen.queryByText("Unknown scope")).not.toBeInTheDocument());
     await waitFor(() => expect(client.getQueryData(["channel-messages", 1, "YOW", "#yow"])).toBeDefined());
@@ -121,7 +121,7 @@ describe("channel scope evidence", () => {
     expect(cache.pageParams).toEqual([undefined]);
     fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
     await waitFor(() =>
-      expect(getChannelMessagesPage).toHaveBeenLastCalledWith(1, expect.objectContaining({ scope: "#yow", cursor: 4 })),
+      expect(getChannelMessagesPage).toHaveBeenLastCalledWith(1, expect.objectContaining({ scope: "#yow", cursor: 4 }), expect.any(AbortSignal)),
     );
   });
   it("explains an empty filtered history", async () => {

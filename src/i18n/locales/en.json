@@ -568,6 +568,8 @@
       "inspect": "Inspect packet from {{sender}}",
       "loading": "Loading messages…",
       "loadingOlder": "Loading older messages… ({{count}} shown)",
+      "jumpToNew": "{{count}} new messages. Jump to latest",
+      "latest": "Latest messages",
       "loadOlder": "Load older messages",
       "empty": "No messages for this channel.",
       "emptyScope": "No messages match {{scope}}.",

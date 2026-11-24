@@ -53,6 +53,15 @@ async function errorFrom(res: Response): Promise<ApiError> {
 
 // No referrer or mode options: the analyzer's scrape block lets /api calls through on their Referer or Origin.
 function apiFetch(url: URL, signal?: AbortSignal): Promise<Response> {
+  if (import.meta.env.MODE === "ukmesh-feed") {
+    const deadline = AbortSignal.timeout(10_000);
+    return fetch(url.toString(), {
+      signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
+      credentials: "omit",
+      cache: "no-store",
+      redirect: "error",
+    });
+  }
   return signal ? fetch(url.toString(), { signal }) : fetch(url.toString());
 }
 
@@ -149,16 +158,16 @@ export async function getIataBorder(iata: string): Promise<IataBorder | null> {
 }
 
 // newer servers list each region's member IATAs and map hints too (the detail's fields)
-export function getRegions(): Promise<(RegionSummary & Partial<Region>)[]> {
-  return request("/regions");
+export function getRegions(signal?: AbortSignal): Promise<(RegionSummary & Partial<Region>)[]> {
+  return request("/regions", undefined, signal);
 }
 
-export function getRegion(regionId: number): Promise<Region> {
-  return request(`/regions/${regionId}`);
+export function getRegion(regionId: number, signal?: AbortSignal): Promise<Region> {
+  return request(`/regions/${regionId}`, undefined, signal);
 }
 
 // Preserve the server cursor rather than deriving it from the displayed channel order.
-export function getChannels(params?: { iatas?: string[]; limit?: number; cursor?: number | string; keyKnown?: boolean }): Promise<ChannelPage> {
+export function getChannels(params?: { iatas?: string[]; limit?: number; cursor?: number | string; keyKnown?: boolean }, signal?: AbortSignal): Promise<ChannelPage> {
   if (noIatas(params?.iatas)) return Promise.resolve(emptyPage());
   const iatas = params?.iatas ?? [];
   return request("/channels", {
@@ -168,7 +177,7 @@ export function getChannels(params?: { iatas?: string[]; limit?: number; cursor?
     cursor: typeof params?.cursor === "number" ? params.cursor : undefined,
     pageCursor: typeof params?.cursor === "string" ? params.cursor : undefined,
     keyKnown: params?.keyKnown === undefined ? undefined : String(params.keyKnown),
-  });
+  }, signal);
 }
 
 // Channel messages come back as { items } ordered id DESC, so the last row is the page's oldest
@@ -177,6 +186,7 @@ export function getChannels(params?: { iatas?: string[]; limit?: number; cursor?
 export async function getChannelMessagesPage(
   channelId: number,
   params?: { iatas?: string[]; cursor?: number; limit?: number; scope?: string },
+  signal?: AbortSignal,
 ): Promise<CursorPage<ChannelMessage>> {
   if (noIatas(params?.iatas)) return emptyPage();
   const limit = params?.limit ?? DEFAULT_PAGE_SIZE;
@@ -185,7 +195,7 @@ export async function getChannelMessagesPage(
     cursor: params?.cursor,
     limit,
     scope: params?.scope || undefined,
-  });
+  }, signal);
   if (typeof page.hasMore === "boolean") return { items: page.items, nextCursor: page.nextCursor ?? null, hasMore: page.hasMore };
   return toCursorPage(page.items, limit, (m) => m.id);
 }

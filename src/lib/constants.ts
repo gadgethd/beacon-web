@@ -1,13 +1,14 @@
 import { runtimeEnv } from "./runtime-env";
 
-export const API_BASE = runtimeEnv("VITE_API_BASE", import.meta.env.VITE_API_BASE) ?? "/api/v1";
+const ukmeshFeed = import.meta.env.MODE === "ukmesh-feed";
+export const API_BASE = ukmeshFeed ? "/beacon/api/v1" : runtimeEnv("VITE_API_BASE", import.meta.env.VITE_API_BASE) ?? "/api/v1";
 function defaultWsUrl(): string {
   if (typeof window === "undefined") return "ws://localhost:8080/ws";
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/ws`;
+  return `${protocol}//${window.location.host}${ukmeshFeed ? "/beacon/ws" : "/ws"}`;
 }
 
-export const WS_URL = runtimeEnv("VITE_WS_URL", import.meta.env.VITE_WS_URL) ?? defaultWsUrl();
+export const WS_URL = ukmeshFeed ? defaultWsUrl() : runtimeEnv("VITE_WS_URL", import.meta.env.VITE_WS_URL) ?? defaultWsUrl();
 
 export const LIVE_BUFFER_CAP = 500;
 export const DEFAULT_PAGE_SIZE = 50;

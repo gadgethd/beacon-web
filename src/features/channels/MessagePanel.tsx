@@ -1,5 +1,5 @@
 import { useMemo, useRef, useLayoutEffect, useState, useCallback } from "react";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { getChannelMessagesPage } from "../../api/client";
 import { Badge } from "../../components/Badge";
@@ -67,18 +67,22 @@ interface MessagePanelProps {
   onBack?: () => void;
   scope?: string;
   onScopeChange?: (scope: string) => void;
+  publicFeed?: boolean;
 }
 
-export function MessagePanel({ channel, heardCounts, iatas, regionKey, onAnalyze, onBack, scope = "", onScopeChange }: MessagePanelProps) {
+export function MessagePanel({ channel, heardCounts, iatas, regionKey, onAnalyze, onBack, scope = "", onScopeChange, publicFeed = false }: MessagePanelProps) {
   const { t } = useTranslation();
-  const scopeNames = useScopes(scope);
+  const scopeNames = useScopes(scope, Boolean(onScopeChange));
+  const client = useQueryClient();
+  const queryKey = ["channel-messages", channel?.id, regionKey, scope];
   const { data, isLoading, isError, isFetching, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
-    queryKey: ["channel-messages", channel?.id, regionKey, scope],
-    queryFn: ({ pageParam }) => getChannelMessagesPage(channel!.id, { iatas, cursor: pageParam, limit: 50, scope }),
+    queryKey,
+    queryFn: ({ pageParam, signal }) => getChannelMessagesPage(channel!.id, { iatas, cursor: pageParam, limit: 50, scope }, signal),
     getNextPageParam: (last) => last.hasMore ? last.nextCursor ?? undefined : undefined,
     initialPageParam: undefined as number | undefined,
     enabled: channel !== null,
     staleTime: 30_000,
+    maxPages: publicFeed ? 10 : undefined,
   });
 
   // flatten order is irrelevant — the ascending sort below restores chat order from newest-first pages
@@ -96,9 +100,10 @@ export function MessagePanel({ channel, heardCounts, iatas, regionKey, onAnalyze
   );
 
   const [userScrolled, setUserScrolled] = useState(false);
+  const [newMessages, setNewMessages] = useState(0);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const viewKey = `${channel?.id ?? ""}:${scope}`;
-  const scrollAnchor = useRef<{ view?: string; count: number }>({ count: 0 });
+  const scrollAnchor = useRef<{ view?: string; newest?: string }>({});
   // pre-prepend scroll metrics, captured while a load-older fetch is in flight
   const prepend = useRef<{ pending: boolean; prevHeight: number; prevTop: number }>({
     pending: false,
@@ -111,36 +116,39 @@ export function MessagePanel({ channel, heardCounts, iatas, regionKey, onAnalyze
   if (prevView !== viewKey) {
     setPrevView(viewKey);
     setUserScrolled(false);
+    setNewMessages(0);
   }
 
   useLayoutEffect(() => {
     const el = scrollContainerRef.current;
     const anchor = scrollAnchor.current;
+    const newest = sorted.at(-1)?.packetHash;
 
     if (anchor.view !== viewKey) {
       // first batch for this channel — jump to the bottom once it lands
       if (isLoading) return;
       anchor.view = viewKey;
-      anchor.count = sorted.length;
+      anchor.newest = newest;
       prepend.current = { pending: false, prevHeight: 0, prevTop: 0 };
       if (el) el.scrollTop = el.scrollHeight;
       return;
     }
 
-    if (prepend.current.pending) {
+    const restoredPrepend = prepend.current.pending;
+    if (restoredPrepend) {
+      if (isFetchingNextPage) return;
       // older page prepended — re-add its height to hold the read position (overflow-anchor is off)
       prepend.current.pending = false;
       if (el) el.scrollTop = prepend.current.prevTop + (el.scrollHeight - prepend.current.prevHeight);
-      anchor.count = sorted.length;
-      return;
     }
 
-    if (sorted.length > anchor.count && !userScrolled) {
-      // live message arrived; follow it down. Not scrollIntoView — that also scrolls the page shell
-      el?.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    if (newest && newest !== anchor.newest && anchor.newest) {
+      const previous = sorted.findIndex((message) => message.packetHash === anchor.newest);
+      if (previous >= 0 && userScrolled) setNewMessages((count) => count + sorted.length - 1 - previous);
+      else if (!userScrolled && !restoredPrepend && el) el.scrollTo({ top: el.scrollHeight, behavior: "instant" });
     }
-    anchor.count = sorted.length;
-  }, [sorted.length, viewKey, isLoading, userScrolled]);
+    anchor.newest = newest;
+  }, [sorted, viewKey, isLoading, isFetchingNextPage, userScrolled]);
 
   const loadOlder = useCallback(() => {
     if (!hasNextPage || isFetching) return;
@@ -154,6 +162,7 @@ export function MessagePanel({ channel, heardCounts, iatas, regionKey, onAnalyze
     if (!el) return;
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     setUserScrolled(!atBottom);
+    if (atBottom) setNewMessages(0);
     // near the top: pull the next older page, capturing metrics so the prepend can hold position
     if (el.scrollTop < 40) loadOlder();
   }, [loadOlder]);
@@ -198,6 +207,16 @@ export function MessagePanel({ channel, heardCounts, iatas, regionKey, onAnalyze
           {channel.isHashtag && <Badge variant="group">{t("channelMessages.hashtag")}</Badge>}
         </div>
       </div>
+
+      {newMessages > 0 && <button type="button" className="self-center rounded border border-border bg-bg-raised px-3 py-2 text-text-bright"
+        onClick={() => { const el = scrollContainerRef.current; if (el) el.scrollTop = el.scrollHeight; setNewMessages(0); setUserScrolled(false); }}>
+        {t("channelMessages.jumpToNew", { count: newMessages })}
+      </button>}
+
+      {publicFeed && data?.pageParams[0] !== undefined && <button type="button" className="self-center px-3 py-2 text-primary"
+        onClick={() => { scrollAnchor.current.view = undefined; setNewMessages(0); setUserScrolled(false); void client.resetQueries({ queryKey, exact: true }); }}>
+        {t("channelMessages.latest")}
+      </button>}
 
       {!channel.keyKnown && (
         <div className="px-3 py-1.5 bg-warn/5 border-b border-warn/20 text-warn text-xs font-mono">

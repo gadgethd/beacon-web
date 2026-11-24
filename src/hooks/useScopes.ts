@@ -6,12 +6,12 @@ import { useRegion } from "./useRegion";
 // Scope names for the filter dropdowns, limited to the selected region ("All" lists every scope).
 // `keep` is the current selection: it stays an option even when outside the region, so a shared link
 // still filters. The filtering itself stays client-side on each record's scope.
-export function useScopes(keep?: string | string[]): string[] {
+export function useScopes(keep?: string | string[], enabled = true): string[] {
   const { iatas, regionKey, isResolved } = useRegion();
   const { data } = useQuery({
     queryKey: ["scopes", regionKey],
     queryFn: () => getScopes(iatas),
-    enabled: isResolved !== false,
+    enabled: enabled && isResolved !== false,
     staleTime: 5 * 60_000,
   });
 
