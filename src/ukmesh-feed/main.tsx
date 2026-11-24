@@ -1,4 +1,5 @@
-import { StrictMode, useEffect, useState } from "react";
+import { StrictMode, useCallback, useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { ready } from "../i18n";
@@ -9,14 +10,14 @@ import { useWsStatus } from "../hooks/useWsStatus";
 import { WsManager } from "../api/ws-manager";
 import { queryRetryDefaults } from "../api/rate-limit";
 import { WS_URL } from "../lib/constants";
-import { usePrivacyGeneration } from "./privacy";
+import { useBeaconRevision } from "./privacy";
 import "../index.css";
 import "./theme.css";
 
 const EVENTS = ["channelMessage"];
 
-function Channels() {
-  const [manager] = useState(() => new WsManager(WS_URL));
+function Channels({ recheck }: { recheck: () => void }) {
+  const [manager] = useState(() => new WsManager(WS_URL, recheck));
   const { iatas, isResolved } = useRegion();
   const { status } = useWsStatus(manager);
   const queryClient = useQueryClient();
@@ -40,18 +41,30 @@ function Channels() {
   </>;
 }
 
-function PublicChannels() {
+function PublicChannels({ recheck }: { recheck: () => void }) {
   const [client] = useState(() => new QueryClient({ defaultOptions: { queries: { ...queryRetryDefaults, gcTime: 0 } } }));
   const [selection] = useState(() => parseSelection(new URLSearchParams(location.search)));
   useEffect(() => () => client.clear(), [client]);
   return <QueryClientProvider client={client}>
-    <RegionProvider defaultSelection={selection}><Channels /></RegionProvider>
+    <RegionProvider defaultSelection={selection}><Channels recheck={recheck} /></RegionProvider>
   </QueryClientProvider>;
+}
+
+function ChannelsPanel({ recheck }: { recheck: () => void }) {
+  const revision = useBeaconRevision();
+  return <section className="ukmesh-feed-panel" aria-label="Public channels">
+    {revision ? <PublicChannels key={revision} recheck={recheck} /> : (
+      <div className="ukmesh-feed-empty" role="status">
+        <p>{revision === null ? "Public channels are unavailable." : "Checking channel availability…"}</p>
+        {revision === null && <button type="button" onClick={recheck}>Retry</button>}
+      </div>
+    )}
+  </section>;
 }
 
 function Feed() {
   const [retry, setRetry] = useState(0);
-  const generation = usePrivacyGeneration(retry);
+  const recheck = useCallback(() => flushSync(() => setRetry((attempt) => attempt + 1)), []);
   return <div className="ukmesh-feed">
     <a className="ukmesh-feed-skip" href="#channels">Skip to channels</a>
     <header className="ukmesh-feed-header">
@@ -64,14 +77,7 @@ function Feed() {
         <a href="/feed" aria-current="page">Channels</a>
         <a href="/feed/packets">Packets</a>
       </nav>
-      <section className="ukmesh-feed-panel" aria-label="Public channels">
-        {generation ? <PublicChannels key={generation} /> : (
-          <div className="ukmesh-feed-empty" role="status">
-            <p>{generation === null ? "Public channels are unavailable." : "Checking channel availability…"}</p>
-            {generation === null && <button type="button" onClick={() => setRetry((attempt) => attempt + 1)}>Retry</button>}
-          </div>
-        )}
-      </section>
+      <ChannelsPanel key={retry} recheck={recheck} />
     </main>
   </div>;
 }

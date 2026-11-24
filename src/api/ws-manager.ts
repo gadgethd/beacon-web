@@ -53,9 +53,11 @@ export class WsManager {
   private observerStatusHandlers: ObserverStatusHandler[] = [];
   private nodeUpdateHandlers: NodeUpdateHandler[] = [];
   private statusHandlers: StatusHandler[] = [];
+  private readonly onPolicyClose?: () => void;
 
-  constructor(url: string) {
+  constructor(url: string, onPolicyClose?: () => void) {
     this.url = url;
+    this.onPolicyClose = onPolicyClose;
   }
 
   getStatus(): WsStatus {
@@ -197,6 +199,10 @@ export class WsManager {
       this.clearTimers();
       if (this.intentionalClose) {
         this.setStatus("disconnected");
+        return;
+      }
+      if (e.code === 1008 && this.everConnected && this.onPolicyClose) {
+        this.onPolicyClose();
         return;
       }
       // any unexpected close — including a server-sent 1000 — gets a reconnect
