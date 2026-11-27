@@ -155,7 +155,7 @@ export function PacketList({ wsManager, onAnalyze, onViewPath, selectedObservati
   }, []);
 
   return (
-    <div className="flex flex-1 min-h-0">
+    <div className="flex flex-1 min-h-0 min-w-0 w-full">
       <div className="relative flex flex-col flex-1 min-h-0 min-w-0">
         <FilterBar
           typeOptions={TYPE_OPTIONS}

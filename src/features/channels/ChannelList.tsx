@@ -273,7 +273,9 @@ export function ChannelList({ wsManager, onAnalyze, publicFeed = false }: Channe
               />
             )}
             {!keyedLoading && filteredChannels.length === 0 && !keyed.isError && !others.isError && (
-              <p className="px-3 py-2 text-xs font-mono text-text-muted">{t("channels.noMatches")}</p>
+              <p className="px-3 py-2 text-xs font-mono text-text-muted">
+                {publicFeed && channels.length === 0 ? "No channel messages have arrived yet." : t("channels.noMatches")}
+              </p>
             )}
             {(keyed.isError || others.isError) && <p role="alert" className="px-3 py-2 text-xs text-danger">{t("channels.loadError")}</p>}
             {keyed.isError ? (

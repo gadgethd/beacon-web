@@ -26,8 +26,15 @@ export default defineConfig(({ mode }) => {
     ...(ukmeshFeed ? {
       base: "/beacon-feed/",
       build: { rollupOptions: { input: fileURLToPath(new URL("./ukmesh-feed.html", import.meta.url)) } },
+    } : mode === "companion" ? {
+      build: { rollupOptions: { input: ["index.html", "channels.html"] } },
     } : {}),
-    plugins: [react(), tailwindcss()],
+    plugins: [react(), tailwindcss(), {
+      name: "ukmesh-local-theme",
+      transformIndexHtml: mode === "companion"
+        ? () => [{ tag: "link", attrs: { rel: "stylesheet", href: "/ukmesh-theme/tokens.css" }, injectTo: "head-prepend" }]
+        : undefined,
+    }],
     define: { __APP_VERSION__: JSON.stringify(pkg.version), __LANGUAGE_NAMES__: JSON.stringify(languageNames) },
     server: proxyTarget
       ? {

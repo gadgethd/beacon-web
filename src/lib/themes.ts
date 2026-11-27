@@ -8,7 +8,8 @@ export interface Theme {
   hidden?: boolean;
 }
 
-export const DEFAULT_THEME_ID = "neutral-blue";
+const ukmeshMode = import.meta.env.MODE === "companion";
+export const DEFAULT_THEME_ID = ukmeshMode ? "ukmesh" : "neutral-blue";
 
 const FALLBACK: Theme = {
   id: "neutral-blue",
@@ -32,15 +33,39 @@ const FALLBACK: Theme = {
   },
 };
 
+const UKMESH: Theme = {
+  id: "ukmesh",
+  name: "UK Mesh",
+  vars: {
+    ...FALLBACK.vars,
+    "--palette-bg-base": "var(--ukmesh-bg)",
+    "--palette-bg-surface": "var(--ukmesh-panel)",
+    "--palette-bg-raised": "var(--ukmesh-raised)",
+    "--palette-border": "var(--ukmesh-border)",
+    "--palette-border-subtle": "var(--ukmesh-border)",
+    "--palette-primary": "var(--ukmesh-accent)",
+    "--palette-primary-dim": "var(--ukmesh-hover)",
+    "--palette-green": "var(--ukmesh-success)",
+    "--palette-danger": "var(--ukmesh-danger)",
+    "--palette-warn": "var(--ukmesh-warning)",
+    "--palette-text-bright": "var(--ukmesh-text)",
+    "--palette-text-normal": "var(--ukmesh-muted)",
+    "--palette-text-muted": "var(--ukmesh-muted)",
+  },
+};
+
 export async function loadThemes(): Promise<Theme[]> {
+  let themes = [FALLBACK];
   try {
-    const res = await fetch(`${import.meta.env.BASE_URL}themes.json`);
-    if (!res.ok) return [FALLBACK];
-    const data: Theme[] = await res.json();
-    return data.length > 0 ? data : [FALLBACK];
+    const response = await fetch(`${import.meta.env.BASE_URL}themes.json`);
+    if (response.ok) {
+      const data: Theme[] = await response.json();
+      if (data.length > 0) themes = data;
+    }
   } catch {
-    return [FALLBACK];
+    // A missing configuration still leaves the built-in theme available.
   }
+  return ukmeshMode ? [UKMESH, ...themes] : themes;
 }
 
 // Rebuild the browser-tab favicon in the active primary color. A favicon file
@@ -72,5 +97,8 @@ export function applyTheme(theme: Theme) {
   for (const [prop, value] of Object.entries(theme.vars)) {
     root.style.setProperty(prop, value);
   }
-  updateFavicon(theme.vars["--palette-primary"] ?? "#3B82F6");
+  const primary = theme.id === UKMESH.id
+    ? getComputedStyle(root).getPropertyValue("--ukmesh-accent").trim()
+    : theme.vars["--palette-primary"];
+  updateFavicon(primary || "#3B82F6");
 }
