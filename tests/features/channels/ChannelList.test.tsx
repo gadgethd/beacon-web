@@ -11,9 +11,6 @@ import type { WsManager } from "../../../src/api/ws-manager";
 let region = { iatas: ["YYZ"], regionKey: "YYZ" };
 let onMessage: (data: ChannelMessage) => void;
 vi.mock("../../../src/hooks/useRegion", () => ({ useRegion: () => region }));
-vi.mock("../../../src/hooks/useWsHandlers", () => ({
-  useWsChannelMessageHandler: (_manager: unknown, handler: typeof onMessage) => { onMessage = handler; },
-}));
 vi.mock("../../../src/features/channels/MessagePanel", () => ({
   MessagePanel: ({ channel }: { channel: ChannelSummary | null }) => <div data-testid="selected-channel">{channel?.id ?? "none"}</div>,
 }));
@@ -35,7 +32,8 @@ const calls = (kind: "true" | "false") => fetchMock.mock.calls.map(([url]) => ne
 const lastCall = (kind: "true" | "false") => calls(kind).at(-1)!;
 
 function show(client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
-  const app = () => <QueryClientProvider client={client}><ChannelList wsManager={{} as WsManager} onAnalyze={() => {}} /></QueryClientProvider>;
+  const manager = { onChannelMessage(handler: typeof onMessage) { onMessage = handler; return () => {}; } } as WsManager;
+  const app = () => <QueryClientProvider client={client}><ChannelList wsManager={manager} onAnalyze={() => {}} /></QueryClientProvider>;
   return { ...render(app()), client, app };
 }
 function deferred<T>() {
@@ -159,9 +157,10 @@ describe("channel directory", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Load other channels" }));
     fireEvent.click(await screen.findByRole("button", { name: /#Other 60/ }));
     const event = { id: 1, packetHash: "fixture", channelHash: other(60).channelHash, senderName: "fixture", content: "fixture", sentAt: 20000 };
-    act(() => onMessage(event));
+    act(() => { onMessage(event); onMessage({ ...event, sentAt: 21000 }); });
+    await waitFor(() => expect(client.getQueryData<InfiniteData<CursorPage<ChannelSummary>>>(["channels", "YYZ", "other"])
+      ?.pages[0]?.items[0]?.lastSeen).toBe(21000));
     const cached = client.getQueryData<InfiniteData<CursorPage<ChannelSummary>>>(["channels", "YYZ", "other"])!;
-    expect(cached.pages[0]!.items[0]!.lastSeen).toBe(20000);
     expect(cached.pages[0]!.nextCursor).toBe(5000);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     act(() => onMessage({ ...event, channelHash: "ff" }));
@@ -174,15 +173,69 @@ describe("channel directory", () => {
   it("coalesces unseen live channels during a keyed fetch into one refresh", async () => {
     const slow = pending();
     keyed(page([channel(1)], 5000), slow.promise, page([channel(99, "New live channel")]));
-    show();
+    const { client } = show();
     await screen.findByText("#Channel 1");
     const event = { id: 1, packetHash: "fixture", channelHash: "ff", senderName: "fixture", content: "fixture", sentAt: 20000 };
-    act(() => { onMessage(event); onMessage({ ...event, channelHash: "fe" }); });
+    act(() => { onMessage(event); onMessage({ ...event, channelHash: "fe" }); onMessage({ ...event, channelHash: "01" }); });
+    await waitFor(() => expect(client.getQueryData<InfiniteData<CursorPage<ChannelSummary>>>(["channels", "YYZ", "keyed"])
+      ?.pages[0]?.items[0]?.lastSeen).toBe(event.sentAt));
     expect(calls("true")).toHaveLength(2);
     await act(async () => slow.resolve(response(page([channel(2)]))));
     await screen.findByText("#New live channel");
     expect(calls("true")).toHaveLength(3);
     expect(lastCall("true").searchParams.has("cursor")).toBe(false);
+  });
+
+  it("keeps one history row per packet when several observations arrive in a batch", async () => {
+    keyed(page([channel(1)]));
+    const { client } = show();
+    fireEvent.click(await screen.findByText("#Channel 1"));
+    const key = ["channel-messages", 1, "YYZ", ""];
+    const firstPage = { items: [], nextCursor: 42, hasMore: true };
+    client.setQueryData(key, { pages: [firstPage], pageParams: [undefined] });
+    const directoryReads = vi.spyOn(client, "getQueriesData");
+    const message = { id: 1, packetHash: "packet", channelId: 1, channelHash: "01", senderName: "fixture", content: "hello", sentAt: 20000 };
+    act(() => {
+      onMessage(message);
+      onMessage({ ...message, observationCount: 3 });
+      onMessage({ ...message, id: 2, packetHash: "unselected", channelId: 2 });
+    });
+    await waitFor(() => {
+      const cached = client.getQueryData<InfiniteData<CursorPage<ChannelMessage>>>(key)!;
+      expect(cached.pages[0]?.items).toEqual([message]);
+      expect(cached.pages[0]?.nextCursor).toBe(42);
+    });
+    expect(directoryReads).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles the old directory and history if a channel switch beats a queued batch", async () => {
+    keyed(page([channel(1), channel(2)]), page([{ ...channel(1), lastSeen: 20000 }, channel(2)]));
+    const { client } = show();
+    fireEvent.click(await screen.findByText("#Channel 1"));
+    const oldKey = ["channel-messages", 1, "YYZ", ""];
+    const nextKey = ["channel-messages", 2, "YYZ", ""];
+    const empty = { pages: [page([])], pageParams: [undefined] };
+    client.setQueryData(oldKey, empty);
+    client.setQueryData(nextKey, empty);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const nextChannel = screen.getByText("#Channel 2");
+
+    vi.useFakeTimers();
+    try {
+      act(() => {
+        onMessage({ id: 1, packetHash: "queued", channelId: 1, channelHash: "01", senderName: "fixture", content: "hello", sentAt: 20000 });
+        fireEvent.click(nextChannel);
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["channels", "YYZ"] }));
+    expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: oldKey, exact: true }));
+    expect(client.getQueryState(oldKey)?.isInvalidated).toBe(true);
+    expect(client.getQueryState(nextKey)?.isInvalidated).toBe(false);
+    expect(client.getQueryData(nextKey)).toEqual(empty);
   });
 
   it("keeps the open channel when it drops out of the list, then resets everything on region change", async () => {
@@ -222,6 +275,8 @@ describe("channel message overflow recovery", () => {
       }
     });
     noteRateLimited(60_000);
+    await waitFor(() => expect(client.getQueryData<InfiniteData<CursorPage<ChannelSummary>>>(["channels", "YYZ", "keyed"])
+      ?.pages[0]?.items[0]?.lastSeen).toBe(20000 + LIVE_BUFFER_CAP));
     await act(async () => fetch.resolve({ pages: [{ items: [], nextCursor: null, hasMore: false }], pageParams: [undefined] }));
     await waitFor(() => expect(client.isFetching({ queryKey: key, exact: true })).toBe(0));
     expect(client.getQueryState(key)?.isInvalidated).toBeFalsy();
@@ -245,6 +300,6 @@ describe("channel message overflow recovery", () => {
     });
     expect(client.getQueryState(key)?.isInvalidated).toBeFalsy();
     act(() => onMessage({ id: LIVE_BUFFER_CAP, packetHash: `h${LIVE_BUFFER_CAP}`, channelHash: "01", senderName: "s", content: "c", sentAt: 30000 }));
-    expect(client.getQueryState(key)?.isInvalidated).toBe(true);
+    await waitFor(() => expect(client.getQueryState(key)?.isInvalidated).toBe(true));
   });
 });

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useLayoutEffect, useState, useCallback } from "react";
+import { memo, useMemo, useRef, useLayoutEffect, useState, useCallback } from "react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { getChannelMessagesPage } from "../../api/client";
@@ -11,6 +11,7 @@ import { useScopes } from "../../hooks/useScopes";
 import { channelDisplayName } from "./types";
 import type { ChannelSummary, ChannelMessage } from "./types";
 import { EmojiText } from "../../components/EmojiText";
+import { createIncrementalSort } from "../../lib/incremental-sort";
 
 // hash the sender name so their color stays consistent
 const SENDER_COLORS = [
@@ -28,7 +29,7 @@ function senderColor(name: string): string {
 }
 
 // Packet hash also identifies messages delivered by older servers without a live ID.
-function MessageRow({ msg, heardCount, onAnalyze }: { msg: ChannelMessage; heardCount?: number; onAnalyze?: (hash: string) => void }) {
+const MessageRow = memo(function MessageRow({ msg, heardCount, onAnalyze }: { msg: ChannelMessage; heardCount?: number; onAnalyze?: (hash: string) => void }) {
   const { t } = useTranslation();
   // REST carries the server-side total; the live WS counter augments it during the session
   const reach = Math.max(msg.observationCount ?? 0, heardCount ?? 0);
@@ -55,7 +56,9 @@ function MessageRow({ msg, heardCount, onAnalyze }: { msg: ChannelMessage; heard
       <div className="text-text-normal text-xs mt-0.5 whitespace-pre-wrap break-words"><EmojiText text={msg.content} /></div>
     </div>
   );
-}
+});
+
+const oldestFirst = (a: ChannelMessage, b: ChannelMessage) => a.sentAt - b.sentAt;
 
 interface MessagePanelProps {
   channel: ChannelSummary | null;
@@ -94,10 +97,8 @@ export function MessagePanel({ channel, heardCounts, iatas, regionKey, onAnalyze
     return [...unique.values()];
   }, [data]);
 
-  const sorted = useMemo(
-    () => [...(messages ?? [])].sort((a, b) => a.sentAt - b.sentAt),
-    [messages],
-  );
+  const [sortMessages] = useState(() => createIncrementalSort<ChannelMessage>());
+  const sorted = useMemo(() => sortMessages(messages, oldestFirst), [messages, sortMessages]);
 
   const [userScrolled, setUserScrolled] = useState(false);
   const [newMessages, setNewMessages] = useState(0);

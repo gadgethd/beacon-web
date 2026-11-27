@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect, useRef, type ReactNode } from "react";
+import { useState, useCallback, useMemo, useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { useInfiniteQuery, useIsFetching, useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { getChannels } from "../../api/client";
@@ -6,7 +6,6 @@ import { isRateLimited, subscribeRateLimit } from "../../api/rate-limit";
 import { LIVE_BUFFER_CAP } from "../../lib/constants";
 import { useRegion } from "../../hooks/useRegion";
 import { useIsMobile } from "../../hooks/useMediaQuery";
-import { useWsChannelMessageHandler } from "../../hooks/useWsHandlers";
 import { SkeletonRows } from "../../components/SkeletonRows";
 import { ChannelSidebar } from "./ChannelSidebar";
 import { ChannelFilterBar } from "./ChannelFilterBar";
@@ -28,8 +27,13 @@ const nextChannelPage = (last: ChannelPage) => last.hasMore ? last.nextPageCurso
 
 function appendMessages(old: InfiniteData<CursorPage<ChannelMessage>> | undefined, messages: ChannelMessage[], bounded: boolean) {
   if (!old) return old;
-  const known = new Set(old.pages.flatMap((page) => page.items.map((message) => message.packetHash)));
-  const added = messages.filter((message) => !known.has(message.packetHash));
+  const known = new Set<string>();
+  for (const page of old.pages) for (const message of page.items) known.add(message.packetHash);
+  const added = messages.filter((message) => {
+    if (known.has(message.packetHash)) return false;
+    known.add(message.packetHash);
+    return true;
+  });
   if (!added.length) return old;
   return { ...old, pages: old.pages.map((page, index) => {
     if (index !== 0) return page;
@@ -40,6 +44,53 @@ function appendMessages(old: InfiniteData<CursorPage<ChannelMessage>> | undefine
     }
     return { ...page, items };
   }) };
+}
+
+function applyChannelTimes(old: InfiniteData<ChannelPage> | undefined, times: ReadonlyMap<number, number>) {
+  if (!old) return old;
+  let changed = false;
+  const pages = old.pages.map((page) => {
+    let pageChanged = false;
+    const items = page.items.map((channel) => {
+      const time = times.get(channel.id);
+      if (time === undefined || time <= channel.lastSeen) return channel;
+      pageChanged = true;
+      return { ...channel, lastSeen: time };
+    });
+    if (!pageChanged) return page;
+    changed = true;
+    return { ...page, items };
+  });
+  return changed ? { ...old, pages } : old;
+}
+
+function batchChannelMessages(apply: (messages: ChannelMessage[]) => void) {
+  let queued: ChannelMessage[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const take = () => {
+    const messages = queued;
+    clearTimeout(timer);
+    timer = undefined;
+    queued = [];
+    return messages;
+  };
+  const flush = () => {
+    const messages = take();
+    if (messages.length) apply(messages);
+  };
+  return {
+    take,
+    add(message: ChannelMessage) {
+      queued.push(message);
+      if (queued.length === LIVE_BUFFER_CAP) flush();
+      else timer ??= setTimeout(flush, 16);
+    },
+  };
+}
+
+function matchesThread(message: ChannelMessage, id: number | null, hash: string | undefined, scope: string) {
+  const matchesChannel = message.channelId !== undefined ? message.channelId === id : message.channelHash === hash;
+  return id !== null && matchesChannel && (!scope || message.scope === scope);
 }
 
 export function ChannelList({ wsManager, onAnalyze, publicFeed = false }: ChannelListProps) {
@@ -93,8 +144,6 @@ export function ChannelList({ wsManager, onAnalyze, publicFeed = false }: Channe
     if (prevRegion.current !== regionKey) {
       prevRegion.current = regionKey;
       refreshPending.current = false;
-      pendingMessages.current.clear();
-      messagesOverflowed.current = false;
       setSelection(null);
       setHeardCounts({});
       setMessageScope("");
@@ -154,15 +203,11 @@ export function ChannelList({ wsManager, onAnalyze, publicFeed = false }: Channe
   }, [keyed.data, others.data]);
 
   const handleSelect = useCallback((id: number) => {
-    pendingMessages.current.clear();
-    messagesOverflowed.current = false;
     setSelection(channels.find((ch) => ch.id === id) ?? null);
     setHeardCounts({});
   }, [channels]);
 
   const handleScopeChange = useCallback((scope: string) => {
-    pendingMessages.current.clear();
-    messagesOverflowed.current = false;
     setMessageScope(scope);
   }, []);
 
@@ -187,56 +232,104 @@ export function ChannelList({ wsManager, onAnalyze, publicFeed = false }: Channe
   );
 
   const selectedChannel = channels.find((ch) => ch.id === selectedId) ?? selection;
+  const selectedHash = selectedChannel?.channelHash;
 
-  const handleChannelMessage = useCallback(
-    (data: ChannelMessage) => {
+  const handleChannelMessages = useCallback(
+    (messages: ChannelMessage[]) => {
       const listKey = ["channels", regionKey];
-      const cachedChannels = queryClient.getQueriesData<InfiniteData<ChannelPage>>({ queryKey: listKey })
-        .flatMap(([, cached]) => cached?.pages.flatMap((p) => p.items) ?? []);
-      const matchesChannel = (ch: ChannelSummary) => data.channelId !== undefined ? ch.id === data.channelId : ch.channelHash === data.channelHash;
-      const known = cachedChannels.find(matchesChannel);
-      if (known) {
+      const byId = new Map<number, ChannelSummary>();
+      const byHash = new Map<string, ChannelSummary>();
+      const directories = queryClient.getQueriesData<InfiniteData<ChannelPage>>({ queryKey: listKey });
+      for (const [, cached] of directories) {
+        for (const page of cached?.pages ?? []) {
+          for (const channel of page.items) {
+            if (!byId.has(channel.id)) byId.set(channel.id, channel);
+            if (!byHash.has(channel.channelHash)) byHash.set(channel.channelHash, channel);
+          }
+        }
+      }
+      const selected = (selectedId === null ? undefined : byId.get(selectedId)) ?? selection;
+      const times = new Map<number, number>();
+      const arrivals: ChannelMessage[] = [];
+      let discoveredChannel = false;
+      for (const data of messages) {
+        const known = data.channelId !== undefined ? byId.get(data.channelId) : byHash.get(data.channelHash);
+        if (known) times.set(known.id, Math.max(times.get(known.id) ?? -Infinity, data.sentAt));
+        else discoveredChannel = true;
+        if (matchesThread(data, selectedId, selected?.channelHash, messageScope)) arrivals.push(data);
+      }
+      if (times.size) {
         // Display timestamps may change; the server's page cursors must not.
-        queryClient.setQueriesData<InfiniteData<ChannelPage>>({ queryKey: listKey }, (old) => old && ({
-          ...old,
-          pages: old.pages.map((p) => ({ ...p, items: p.items.map((ch) => ch.id === known.id
-            ? { ...ch, lastSeen: Math.max(ch.lastSeen, data.sentAt) } : ch) })),
-        }));
-      } else if (!isRateLimited()) {
+        for (const [key, old] of directories) {
+          const next = applyChannelTimes(old, times);
+          if (old !== next) queryClient.setQueryData(key, next);
+        }
+      }
+      if (discoveredChannel && !isRateLimited()) {
         // A decrypted message means a keyed channel; refetch that list from its first page.
         if (queryClient.isFetching({ queryKey: keyedKey, exact: true })) refreshPending.current = true;
         else void queryClient.resetQueries({ queryKey: keyedKey, exact: true });
       }
 
-      const selected = cachedChannels.find((ch) => ch.id === selectedId) ?? selection;
-      if (selected && matchesChannel(selected) && (!messageScope || data.scope === messageScope)) {
+      if (arrivals.length) {
         if (queryClient.isFetching({ queryKey: messageKey, exact: true }) || !queryClient.getQueryData(messageKey)) {
-          if (pendingMessages.current.size >= LIVE_BUFFER_CAP && !pendingMessages.current.has(data.packetHash)) {
-            messagesOverflowed.current = true;
-          } else pendingMessages.current.set(data.packetHash, data);
+          for (const data of arrivals) {
+            if (pendingMessages.current.size >= LIVE_BUFFER_CAP && !pendingMessages.current.has(data.packetHash)) {
+              messagesOverflowed.current = true;
+            } else pendingMessages.current.set(data.packetHash, data);
+          }
         }
         // A fresh arrival is the only signal left once idle-and-overflowed, so try recovery here too.
         flushPending();
         // The WS event has no retained observation total; repeats do not add observers.
         setHeardCounts((prev) => {
-          const previous = prev[data.packetHash];
-          const reach = Math.max(previous ?? 0, data.observationCount ?? 1);
-          if (previous === reach) return prev;
-          const retained = publicFeed && previous === undefined
-            ? Object.fromEntries(Object.entries(prev).slice(-(LIVE_BUFFER_CAP - 1))) : prev;
-          return { ...retained, [data.packetHash]: reach };
+          let next = prev;
+          let grew = false;
+          for (const data of arrivals) {
+            const previous = next[data.packetHash];
+            const reach = Math.max(previous ?? 0, data.observationCount ?? 1);
+            if (previous === reach) continue;
+            if (next === prev) next = { ...prev };
+            if (previous === undefined) grew = true;
+            next[data.packetHash] = reach;
+          }
+          if (publicFeed && grew) {
+            const keys = Object.keys(next);
+            for (const key of keys.slice(0, Math.max(0, keys.length - LIVE_BUFFER_CAP))) delete next[key];
+          }
+          return next;
         });
         // Append to the retained newest page; browsing older history must not evict it.
         queryClient.setQueryData<InfiniteData<CursorPage<ChannelMessage>>>(
           messageKey,
-          (old) => appendMessages(old, [data], publicFeed),
+          (old) => appendMessages(old, arrivals, publicFeed),
         );
       }
     },
     [queryClient, selectedId, selection, regionKey, keyedKey, messageScope, messageKey, flushPending, publicFeed],
   );
 
-  useWsChannelMessageHandler(wsManager, handleChannelMessage);
+  useLayoutEffect(() => {
+    const batch = batchChannelMessages(handleChannelMessages);
+    const pending = pendingMessages.current;
+    const unsubscribe = wsManager.onChannelMessage(batch.add);
+    return () => {
+      unsubscribe();
+      const queued = batch.take();
+      // The old subscription may have been revoked. Let REST reconcile the
+      // affected old scope instead of applying its live payload after the switch.
+      const refetchType = isRateLimited() ? "none" : "active";
+      if (queued.length) {
+        void queryClient.invalidateQueries({ queryKey: ["channels", regionKey], refetchType });
+      }
+      if (pending.size || messagesOverflowed.current
+        || queued.some((message) => matchesThread(message, selectedId, selectedHash, messageScope))) {
+        void queryClient.invalidateQueries({ queryKey: messageKey, exact: true, refetchType });
+      }
+      pending.clear();
+      messagesOverflowed.current = false;
+    };
+  }, [handleChannelMessages, messageKey, messageScope, queryClient, regionKey, selectedHash, selectedId, wsManager]);
 
   // mobile: opening a thread takes over the whole view, hiding the list and filter bar
   const showList = !isMobile || selectedChannel === null;

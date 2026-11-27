@@ -15,11 +15,7 @@ vi.mock("../../../src/api/client", () => ({
 }));
 vi.mock("../../../src/hooks/useRegion", () => ({ useRegion: () => ({ iatas: ["YOW"], regionKey: "YOW" }) }));
 let onMessage: (data: ChannelMessage) => void;
-vi.mock("../../../src/hooks/useWsHandlers", () => ({
-  useWsChannelMessageHandler: (_m: unknown, fn: typeof onMessage) => {
-    onMessage = fn;
-  },
-}));
+const manager = { onChannelMessage(handler: typeof onMessage) { onMessage = handler; return () => {}; } } as WsManager;
 const channel: ChannelSummary = {
   id: 1,
   name: "#test",
@@ -82,7 +78,7 @@ describe("channel scope evidence", () => {
     vi.mocked(getChannelMessagesPage).mockImplementation(async (_id, p) =>
       page(p?.scope === "#yow" ? [messages[0]!] : messages, p?.scope === "#yow" ? 4 : null),
     );
-    const { client } = show(<ChannelList wsManager={{} as WsManager} onAnalyze={() => {}} />);
+    const { client } = show(<ChannelList wsManager={manager} onAnalyze={() => {}} />);
     fireEvent.click(await screen.findByRole("button", { name: /#test/ }));
     await screen.findByText("Unknown scope");
     fireEvent.click(screen.getByRole("button", { name: /Scope.*All scopes/ }));
@@ -131,7 +127,7 @@ describe("channel scope evidence", () => {
   });
   it("keeps messages received during history loading without an extra request", async () => {
     let resolveHistory!: (value: ReturnType<typeof page>) => void;
-    const live = { ...messages[0]!, id: 5, channelId: 1, packetHash: "during-read", content: "arrived during history" };
+    const live = { ...messages[0]!, id: 5, channelId: 1, packetHash: "during-read", content: "arrived during history", sentAt: 2 };
     vi.mocked(getChannelMessagesPage)
       .mockImplementationOnce(
         () =>
@@ -140,13 +136,15 @@ describe("channel scope evidence", () => {
           }),
       )
       .mockResolvedValue(page([live]));
-    show(<ChannelList wsManager={{} as WsManager} onAnalyze={() => {}} />);
+    const { client } = show(<ChannelList wsManager={manager} onAnalyze={() => {}} />);
     fireEvent.click(await screen.findByRole("button", { name: /#test/ }));
     await waitFor(() => expect(getChannelMessagesPage).toHaveBeenCalledTimes(1));
     act(() => {
       onMessage(live);
       onMessage(live);
     });
+    await waitFor(() => expect(client.getQueryData<{ pages: { items: ChannelSummary[] }[] }>(["channels", "YOW", "keyed"])
+      ?.pages[0]?.items[0]?.lastSeen).toBe(live.sentAt));
     await act(async () => resolveHistory(page([])));
     expect(await screen.findByText("arrived during history")).toBeInTheDocument();
     expect(getChannelMessagesPage).toHaveBeenCalledTimes(1);
